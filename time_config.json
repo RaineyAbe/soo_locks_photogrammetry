@@ -1,0 +1,8 @@
+{
+    "video_directory": "/Users/rdcrlrka/Research/Soo_locks/20251001_imagery/video",
+    "clock_times": ["20251001180600"],
+    "output_directory": "/Users/rdcrlrka/Research/Soo_locks/20251001_imagery/frames",
+    "output_format": "tiff",
+    "recursive": true,
+    "filename_pattern": "CAMERA_DATETIME_DATETIME"
+}
