@@ -1,0 +1,145 @@
+# /usr/bin/env python
+
+"""
+Pipeline for constructing an orthoimage and/or digital surface model from video files for the Soo Locks project.
+
+Usage: 
+----------
+python generate_orthoimage.py \
+    -video_folder <path_to_video_folder> \
+    -target_datetime <YYYYMMDDHHMMSS> \
+    -inputs_folder <path_to_inputs_folder> \
+    -output_folder <path_to_output_folder> \
+    -refine_cameras <0/1> \
+    -generate_dsm <0/1>
+"""
+
+import argparse
+import os
+from glob import glob
+# import the utility functions, assuming the ortho_utils.py file is in the root code directory
+import ortho_utils
+
+
+def getparser():
+    parser = argparse.ArgumentParser(description='Wrapper script to pull video frames and generate orthoimage for the Soo Locks project.')
+    parser.add_argument('-video_folder', default=None, type=str, help='path to folder containing video files')
+    parser.add_argument('-target_datetime', default=None, type=str, help='datetime at which to pull video frames')
+    parser.add_argument('-inputs_folder', default=None, type=str, help='path to folder containing standard input files')
+    parser.add_argument('-output_folder', default=None, type=str, help='path to folder where all outputs will be saved')
+    parser.add_argument('-refine_cameras', default=0, type=int, choices=[0,1], help='whether to refine the pre-optimized cameras')
+    parser.add_argument('-generate_dsm', default=0, type=int, choices=[0,1], help='whether to generate a digital surface model where images overlap')
+    return parser
+
+
+def main():
+    # --- Parse the user arguments ---
+    parser = getparser()
+    args = parser.parse_args()
+    video_folder = args.video_folder
+    target_datetime = args.target_datetime
+    inputs_folder = args.inputs_folder
+    output_folder = args.output_folder
+    refine_cameras = bool(args.refine_cameras)
+    generate_dsm = bool(args.generate_dsm)
+
+    # --- Get input files ---
+    refdem_file = os.path.join(inputs_folder, 'lidar_DSM_filled_cropped.tif')
+    distortion_params_file = os.path.join(inputs_folder, 'initial_undistortion_params.csv')
+    camera_folder = os.path.join(inputs_folder, 'calibrated_cameras')
+    closest_cam_map_file = os.path.join(inputs_folder, 'closest_camera_map.tiff')
+
+    # --- Define output folders ---
+    out_folder = os.path.join(output_folder, 'soo_locs_photogrammetry_' + target_datetime)
+    os.makedirs(out_folder, exist_ok=True)
+    image_folder = os.path.join(out_folder, 'images')
+    undistorted_image_folder = os.path.join(out_folder, 'undistorted_images')
+    ortho_folder = os.path.join(out_folder, 'orthoimages')
+    # folders for refining cameras
+    single_band_image_folder = os.path.join(out_folder, 'single_band_images')
+    refined_cam_folder = os.path.join(out_folder, 'refined_cameras')
+    refined_cam_full_folder = os.path.join(out_folder, 'refined_cameras_full_FOV')
+    # folder for creating DSM
+    final_stereo_folder = os.path.join(out_folder, 'final_stereo')
+
+    # --- Run the steps ---
+    print('\n------------------------------------------')
+    print('--- EXTRACTING FRAMES FROM VIDEO FILES ---')
+    print('------------------------------------------\n')
+    ortho_utils.process_video_files(
+        video_files = sorted(glob(os.path.join(video_folder, '*.avi'))), 
+        target_time_string = target_datetime,
+        output_folder = image_folder
+    )
+
+    
+    print('\n-------------------------------------------')
+    print('--- CORRECTING INITIAL IMAGE DISTORTION ---')
+    print('-------------------------------------------\n')
+    ortho_utils.correct_initial_image_distortion(
+        params_file = distortion_params_file, 
+        image_files = sorted(glob(os.path.join(image_folder, '*.tiff'))), 
+        output_folder = undistorted_image_folder, 
+        full_fov=True
+    )
+
+    if refine_cameras:
+        print('\n------------------------')
+        print('--- REFINING CAMERAS ---')
+        print('------------------------\n')
+        # bundle_adjust only takes single-band images and works much better with the cropped FOV.
+        # save single band images
+        ortho_utils.save_single_band_images(
+            image_files = sorted(glob(os.path.join(image_folder, '*.tiff'))),
+            output_folder = single_band_image_folder
+        )
+        # correct initial distortion, save cropped FOV
+        ortho_utils.correct_initial_image_distortion(
+            params_file = distortion_params_file,
+            image_files = sorted(glob(os.path.join(single_band_image_folder, '*.tiff'))),
+            output_folder = undistorted_image_folder,
+            full_fov = False
+        )
+        # refine the cameras
+        ortho_utils.refine_cameras(
+            image_files = sorted(glob(os.path.join(undistorted_image_folder, '*_cropped_fov.tiff'))),
+            camera_files = sorted(glob(os.path.join(camera_folder, '*_cropped_fov.tsai'))),
+            refdem_file = refdem_file,
+            output_folder = refined_cam_folder
+        )
+        # now, adjust them back to the full FOV
+        ortho_utils.update_tsai_intrinsics_to_full_fov(
+            params_file = distortion_params_file,
+            ba_cam_folder = refined_cam_folder,
+            output_cam_folder = refined_cam_full_folder
+        )
+
+
+    print('\n------------------------------')
+    print('--- ORTHORECTIFYING IMAGES ---')
+    print('------------------------------\n')
+    if refine_cameras:
+        print('Using refined cameras')
+        camera_files = sorted(glob(os.path.join(refined_cam_full_folder, '*.tsai')))
+    else:
+        print('Using pre-calibrated cameras')
+        camera_files = sorted(glob(os.path.join(camera_folder, '*_full_fov.tsai')))
+    ortho_utils.orthorectify(
+        image_files = sorted(glob(os.path.join(undistorted_image_folder, '*.tiff'))), 
+        camera_files = camera_files, 
+        refdem_file = refdem_file, 
+        output_folder = ortho_folder
+        )
+
+
+    print('\n------------------------------')
+    print('--- MOSAICKING ORTHOIMAGES ---')
+    print('------------------------------\n')
+    ortho_utils.mosaic_orthoimages(
+        image_files = sorted(glob(os.path.join(ortho_folder, '*.tiff'))), 
+        closest_cam_map_file = closest_cam_map_file, 
+        output_folder = out_folder
+        )
+    
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,12 @@
+name: soo_locks
+channels:
+ - defaults
+ - conda-forge
+dependencies:
+ - python=3.13
+ - pandas
+ - gdal
+ - rioxarray
+ - tqdm
+ - pip:
+   - opencv-python
