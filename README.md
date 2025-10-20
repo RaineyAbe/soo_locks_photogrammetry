@@ -12,6 +12,8 @@ Rainey Aberle<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical Scien
 
 `git clone https://github.com/RaineyAbe/soo_locks_photogrammetry.git`
 
+Optionally, Fork this repository for your own use before cloning. 
+
 2. Install the Python environment using [Mamba](https://mamba.readthedocs.io/en/latest/) or [Conda](https://anaconda.org/anaconda/conda). Required packages are listed in the _"environment.yml"_ file. To install directly from the file, run the following in the command line:
 
 `mamba env create -f environment.yml`
