@@ -12,7 +12,7 @@ Rainey Aberle<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical Scien
 
 `git clone https://github.com/RaineyAbe/soo_locks_photogrammetry.git`
 
-2. Install the Python environment using [Mamba](https://mamba.readthedocs.io/en/latest/) or [Conda](https://anaconda.org/anaconda/conda). Required packages are listed in the `environment.yml` file. To install directly from the file, run the following in the command line:
+2. Install the Python environment using [Mamba](https://mamba.readthedocs.io/en/latest/) or [Conda](https://anaconda.org/anaconda/conda). Required packages are listed in the _"environment.yml"_ file. To install directly from the file, run the following in the command line:
 
 `mamba env create -f environment.yml`
 
@@ -26,11 +26,11 @@ To enable running the commands from anywhere, add the "StereoPipeline-3.6.0*/bin
 
 The command line must often be restarted for this change to take effect. 
 
-3. Download the `inputs` folder with auxilliary pipeline files to your local machine. This folder can be found on the shared RDEPub drive, and contains: 
-- `lidar_DSM_filled_cropped.tif`: reference DSM constructed via lidar scanning, with no data values filled and cropped to the approximate model space. 
-- `initial_undistortion_params.csv`: initial camera and distortion parameters from OpenCV.
-- `calibrated_cameras/*.tsai`: pre-calibrated pinhole camera models for both the cropped and full field of view (FOV) of each camera.
-- `closest_camera_map.tiff`: map of the closest camera at each pixel in the model space, used for constructing the orthomosaic.
+3. Download the _"inputs"_ folder containing auxilliary files to your local machine. This folder can be found on the shared RDEdrivePUB, and contains: 
+- _"lidar_DSM_filled_cropped.tif"_: reference DSM constructed via lidar scanning, with no data values filled and cropped to the approximate model space. 
+- _"initial_undistortion_params.csv"_: initial camera and distortion parameters from OpenCV.
+- _"calibrated_cameras/*.tsai"_: pre-calibrated pinhole camera models for both the cropped and full field of view (FOV) of each camera.
+- _"closest_camera_map.tiff"_: map of the closest camera at each pixel in the model space, used for constructing the orthomosaic.
 
 
 ## Running the pipeline
@@ -47,7 +47,7 @@ Steps in the workflow:
 
 4. Orthorectify images using ASP's `mapproject` program and the reference DSM. 
 
-5. Mosaic orthoimages. First, images are sampled at a unified grid at the user-specified output spatial resolution. Then, image values are sampled from the closest camera (based on positions detected during lidar scanning) at each image pixel. A plot of the closest camera map can be found in the `inputs` folder. 
+5. Mosaic orthoimages. First, images are sampled at a unified grid at the user-specified output spatial resolution. Then, image values are sampled from the closest camera (based on positions detected during lidar scanning) at each image pixel. A plot of the closest camera map can be found in the "inputs" folder. 
 
 6. (Optional) Generate a DSM using the orthoimages and ASP's `stereo` program. Where images overlap, a point cloud is created. Then, point clouds are rasterized/gridded and mosaicked. The default spatial resolution is the user-specified spatial resolution * 2. 
 
