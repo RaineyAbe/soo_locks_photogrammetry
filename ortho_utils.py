@@ -1,4 +1,4 @@
-# /usr/bin/env python
+#! /usr/bin/env python
 
 """
 Utility functions for generating an orthoimage and/or DSM from video files for the Soo Locks project.
@@ -331,13 +331,38 @@ def correct_initial_image_distortion(
     return
 
 
+def determine_threads(
+        threads_string: str = "all"
+        ) -> int:
+    """
+    Parse the number of threads to use from a string. 
+
+    Parameters
+    ----------
+    threads_string: str
+        number of threads to use. options: string containing a number, or "all".
+
+    Returns
+    ----------
+    threads: int
+        number of threads as an integer.
+    """
+    if threads_string=='all':
+        threads = os.cpu_count()
+    else:
+        threads = int(threads_string)
+    print(f"Will use up to {threads} threads for each process.")
+    return threads
+
+
 def orthorectify(
         image_files: list[str] = None, 
         camera_files: list[str] = None, 
         refdem_file: str = None, 
         output_folder: str = None,
         nodata_value: str = 'NaN',
-        out_res: float = 0.003
+        out_res: float = 0.003,
+        threads_string: str = 'all'
         ) -> None:
     """
     Orthorectify images using the Ames Stereo Pipeline's mapproject function and a reference DEM.
@@ -356,6 +381,8 @@ def orthorectify(
         nodata value to use in the output orthorectified images
     out_res: float
         output pixel resolution in meters
+    threads_string: str
+        number of threads to use during mapproject
     
     Returns
     ----------
@@ -363,9 +390,7 @@ def orthorectify(
     """
     os.makedirs(output_folder, exist_ok=True)
 
-    # Determine number of threads to use
-    threads = os.cpu_count()
-    print(f'Will use up to {threads} threads for each process.')
+    threads = determine_threads(threads_string)
 
     # Iterate over files
     for image_file, cam_file in zip(image_files, camera_files):
@@ -531,6 +556,7 @@ def save_single_band_images(
             os.path.join(output_folder, 
                          f"{os.path.splitext(os.path.basename(image_file))[0]}_gdal_translate")
             )
+
     print('Done saving single-band versions of all images.')
     return
 
@@ -539,7 +565,9 @@ def run_stereo(
     image_files: list[str],
     camera_files: list[str],
     output_folder: str,
-    stop_point: int = None
+    stop_point: int = None,
+    refdem_file: str = None,
+    threads_string: str = 'all'
     ):
     """
     Run stereo processing on pairs of images using Ames Stereo Pipeline's parallel_stereo.
@@ -554,6 +582,10 @@ def run_stereo(
         folder where the stereo outputs will be saved
     stop_point: int
         stop point for the stereo processing (if any)
+    refdem_file: str
+        path to reference DEM, required when image files are mapprojected (orthorectified)
+    threads_string: str
+        number of threads to use for parallel_stereo
 
     Returns
     ----------
@@ -561,9 +593,8 @@ def run_stereo(
     """
     os.makedirs(output_folder, exist_ok=True)
 
-    # Determine number of threads to use
-    threads = os.cpu_count()
-    print(f'Will use up to {threads} threads for each process.')
+    # Determine number of threads to use for parallel_stereo
+    threads = determine_threads(threads_string)
     
     # Extract numeric camera IDs (assumes pattern like "*ch01*", "*ch12*")
     def get_cam_num(f):
@@ -618,6 +649,8 @@ def run_stereo(
             ]
             if stop_point:
                 args += ["--stop-point", str(stop_point)]
+            if refdem_file:
+                args += [refdem_file]
 
             print(f"Running stereo for ch{n1:02d}-ch{n2:02d}")
             log = run_cmd("parallel_stereo", args)
@@ -635,10 +668,11 @@ def run_stereo(
 
 
 def refine_cameras(
-    image_files: list[str],
-    camera_files: list[str],
-    refdem_file: str,
-    output_folder: str
+    image_files: list[str] = None,
+    camera_files: list[str] = None,
+    refdem_file: str = None,
+    output_folder: str = None,
+    threads_string: str = 'all'
     ) -> None:
     """
     Refine camera models using bundle adjustment with Ames Stereo Pipeline's parallel_bundle_adjust.
@@ -653,6 +687,8 @@ def refine_cameras(
         path to the reference DEM file
     output_folder: str
         folder where the refined camera models will be saved
+    threads_string: str
+        number of threads to use for parallel processes. 
 
     Returns
     ----------
@@ -668,6 +704,7 @@ def refine_cameras(
         camera_files=camera_files,
         output_folder=output_folder,
         stop_point=1,  # only run pre-processing
+        threads_string=threads_string
     )
 
     # --- Collect match files ---
@@ -710,6 +747,9 @@ def refine_cameras(
         group_match_files[group].append(match_out_file)
 
     # --- Build group-wise image/camera lists from match files ---
+    # Determine number of threads to use
+    threads = determine_threads(threads_string)
+
     print("Building image/camera sets from match files...")
     for group in [1, 2]:
         if not group_match_files[group]:
@@ -745,10 +785,6 @@ def refine_cameras(
         # --- Run bundle adjustment for this group ---
         print(f"\n--- GROUP {group} bundle adjustment: ch{cams_in_group[0]:02d}-ch{cams_in_group[-1]:02d} ---")
 
-        # Determine number of threads to use
-        threads = os.cpu_count()
-        print(f'Will use up to {threads} threads for each process.')
-
         args = [
             "parallel_bundle_adjust",
             "--threads", str(threads),
@@ -772,10 +808,26 @@ def refine_cameras(
 
 
 def update_tsai_intrinsics_to_full_fov(
-    params_file,
-    ba_cam_folder,
-    output_cam_folder,
-):
+    params_file: str = None,
+    ba_cam_folder: str = None,
+    output_cam_folder: str = None
+    ) -> None:
+    """
+    Update .tsai camera files with optimized intrinsics mapped to full field of view.
+
+    Parameters
+    ----------
+    params_file: str
+        path to CSV file containing optimized camera parameters
+    ba_cam_folder: str
+        folder containing the .tsai camera files from bundle adjustment
+    output_cam_folder: str
+        folder where the updated .tsai camera files will be saved
+
+    Returns
+    ----------
+    None
+    """
     os.makedirs(output_cam_folder, exist_ok=True)
 
     # Load the camera and distortion parameters file
@@ -864,4 +916,88 @@ def update_tsai_intrinsics_to_full_fov(
             f.write("\n".join(updated_lines) + "\n")
         print('Saved updated camera with full FOV:', cam_out_file)
 
+    return
+
+
+def rasterize_point_clouds(
+        pc_files: list[str] = None, 
+        t_res: float = 0.006,
+        threads_string: str = 'all'
+        ):
+    """
+    Rasterize point clouds using Ames Stereo Pipeline's point2dem.
+
+    Parameters
+    ----------
+    pc_files: list[str]
+        list of paths to point cloud files
+    t_res: float
+        target resolution for the rasterized DEMs
+    threads_string: str
+        number of threads to use ('all' to use all available cores)
+
+    Returns
+    ----------
+    None
+    """
+    print('Rasterizing point clouds')
+
+    # Determine number of threads to use
+    threads = determine_threads(threads_string)
+
+    # Iterate over point cloud files
+    for pc_file in tqdm(pc_files):
+        args = [
+            '--threads', str(threads),
+            '--tr', str(t_res),
+            pc_file
+        ]
+        log = run_cmd('point2dem', args)
+        log_prefix = os.path.splitext(pc_file)[0] + '_point2dem'
+        log_file = write_log_file(log, log_prefix)
+
+    print('Rasterization of point clouds complete')
+    return
+
+
+def mosaic_dems(
+        dem_files: list[str] = None,
+        output_file: str = None,
+        threads_string: str = 'all'
+    ) -> None:
+    """
+    Mosaic DEM files using Ames Stereo Pipeline's dem_mosaic.
+
+    Parameters
+    ----------
+    dem_files: list[str]
+        list of paths to DEM files to be mosaicked
+    output_file: str
+        path to the output mosaicked DEM file
+    threads_string: str
+        number of threads to use ('all' to use all available cores)
+        
+    Returns
+    ----------
+    None
+    """
+
+    print('Mosaicking DSMs')
+    output_folder = os.path.dirname(output_file)
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Determine number of threads to use
+    threads = determine_threads(threads_string)
+
+    # Run dem_mosaic
+    args = [
+        '--threads', str(threads),
+        '-o', output_file
+    ] + dem_files
+
+    log = run_cmd('dem_mosaic', args)
+    log_prefix = os.path.join(output_folder, 'dem_mosaic')
+    log_file = write_log_file(log, log_prefix)
+
+    print('DEM mosaicking complete.')
     return
