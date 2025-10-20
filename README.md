@@ -18,17 +18,7 @@ Optionally, Fork this repository for your own use before cloning.
 
 `mamba env create -f environment.yml`
 
-3. Install the [Ames Stereo Pipeline v. 3.6.0](https://stereopipeline.readthedocs.io/en/latest/installation.html) (ASP). 
-
-Perhaps the simplest way to install ASP is to download the appropriate precompiled binaries, unzip, and place the folder in your local Applications folder. 
-
-To enable running the commands from anywhere, add the "StereoPipeline-3.6.0*/bin" folder to your `PATH` environment variable, replacing with your actual folder name: 
-
-`export PATH=$PATH:/Applications/StereoPipeline-3.6.0*/bin`
-
-The command line must often be restarted for this change to take effect. 
-
-4. Download the _"inputs"_ folder containing auxilliary files to your local machine. This folder can be found on the shared RDEdrivePUB, and contains: 
+3. Download the _"inputs"_ folder containing auxilliary files to your local machine. This folder can be found on the shared RDEdrivePUB, and contains: 
 - _"lidar_DSM_filled_cropped.tif"_: reference DSM constructed via lidar scanning, with no data values filled and cropped to the approximate model space. 
 - _"initial_undistortion_params.csv"_: initial camera and distortion parameters from OpenCV.
 - _"calibrated_cameras/*.tsai"_: pre-calibrated pinhole camera models for both the cropped and full field of view (FOV) of each camera.

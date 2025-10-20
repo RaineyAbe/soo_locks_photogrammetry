@@ -1,9 +1,10 @@
 name: soo_locks
 channels:
- - defaults
+ - nasa-ames-stereo-pipeline
+ - usgs-astrogeology
  - conda-forge
 dependencies:
- - python=3.13
+ - stereo-pipeline=3.5.0
  - pandas
  - gdal
  - rioxarray
