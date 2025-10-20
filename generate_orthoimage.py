@@ -34,7 +34,7 @@ def getparser():
     parser.add_argument('-output_folder', default=None, type=str, help='path to folder where all outputs will be saved')
     parser.add_argument('-refine_cameras', default=0, type=int, choices=[0,1], help='whether to refine the pre-optimized cameras')
     parser.add_argument('-output_res', default=0.003, type=float, help='output spatial resolution of the orthoimages.')
-    parser.add_argument('-threads', default='all', type=str, help='number of threads to use for parallel processes. Options = the number of threads or "all".')
+    parser.add_argument('-threads', default='all', type=str, help='number of threads to use for parallel processes. Options = number of threads or "all".')
     parser.add_argument('-generate_dsm', default=0, type=int, choices=[0,1], help='whether to generate a digital surface model where images overlap')
     return parser
 
@@ -67,7 +67,8 @@ def main():
 
     # --- Set up logging ---
     # Define the timestamped log file name
-    log_file = os.path.join(out_folder, f'compiled_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log')
+    dt_now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    log_file = os.path.join(out_folder, f'compiled_log_{dt_now}.log')
     # Configure logging: writes to file and console
     logging.basicConfig(
         level=logging.INFO,
