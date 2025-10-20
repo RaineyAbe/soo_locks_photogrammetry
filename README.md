@@ -4,10 +4,7 @@ Pipeline and utility functions for constructing orthoimages for the Soo Locks pr
 
 ## Correspondence
 
-Rainey Aberle 
-$\newline\newline$ Email: Rainey.K.Aberle@erdc.dren.mil
-$\newline\newline$ Research Physical Scientist
-$\newline\newline$ USACE-ERDC Cold Regions Research and Engineering Laboratory (CRREL)
+Rainey Aberle<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical Scientist<br>USACE-ERDC Cold Regions Research and Engineering Laboratory (CRREL)
 
 ## Installation
 
