@@ -22,6 +22,7 @@ from glob import glob
 import sys
 import logging
 from datetime import datetime
+from tqdm import tqdm
 # import the utility functions, assuming the ortho_utils.py file is in the root code directory
 import ortho_utils
 
@@ -53,7 +54,7 @@ def main():
     generate_dsm = bool(args.generate_dsm)
 
     # --- Define output folders ---
-    out_folder = os.path.join(output_folder, 'soo_locs_photogrammetry_' + target_datetime)
+    out_folder = os.path.join(output_folder, 'soo_locks_photogrammetry_' + target_datetime)
     os.makedirs(out_folder, exist_ok=True)
     image_folder = os.path.join(out_folder, 'images')
     undistorted_image_folder = os.path.join(out_folder, 'undistorted_images')
@@ -67,8 +68,8 @@ def main():
 
     # --- Set up logging ---
     # Define the timestamped log file name
-    dt_now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    log_file = os.path.join(out_folder, f'compiled_log_{dt_now}.log')
+    dt_now = datetime.now().strftime('%Y%m%d%H%M%S')
+    log_file = os.path.join(out_folder, f'soo_locks_photogrammetry_{dt_now}.log')
     # Configure logging: writes to file and console
     logging.basicConfig(
         level=logging.INFO,
@@ -120,7 +121,6 @@ def main():
         output_folder = image_folder
     )
 
-    
     print('\n-------------------------------------------')
     print('--- CORRECTING INITIAL IMAGE DISTORTION ---')
     print('-------------------------------------------\n')
@@ -163,7 +163,6 @@ def main():
             output_cam_folder = refined_cam_full_folder
         )
 
-
     print('\n------------------------------')
     print('--- ORTHORECTIFYING IMAGES ---')
     print('------------------------------\n')
@@ -182,7 +181,6 @@ def main():
         threads_string = threads
         )
 
-
     print('\n------------------------------')
     print('--- MOSAICKING ORTHOIMAGES ---')
     print('------------------------------\n')
@@ -192,45 +190,51 @@ def main():
         output_folder = out_folder,
         )
     
-
     if generate_dsm:
         print('\n----------------------')
         print('--- GENERATING DSM ---')
         print('----------------------\n')
         # Run stereo
-        print('Running stereo')
-        image_files = [x for x in sorted(glob(os.path.join(ortho_folder, '*.tiff'))) 
-                       if os.path.basename(x)!='orthomosaic.tiff']
+        print('\nRunning stereo')
+        image_files = [x for x in sorted(glob(os.path.join(ortho_folder, '*.tiff')))
+                       if 'mosaic' not in os.path.basename(x)]
         if refine_cameras:
             print('Using refined cameras')
             camera_files = sorted(glob(os.path.join(refined_cam_full_folder, '*.tsai')))
         else:
             print('Using pre-calibrated cameras')
-        camera_files = sorted(glob(os.path.join(camera_folder, '*_full_fov.tsai')))
+            camera_files = sorted(glob(os.path.join(camera_folder, '*_full_fov.tsai')))
         ortho_utils.run_stereo(
             image_files = image_files,
             camera_files = camera_files,
             output_folder = final_stereo_folder,
-            refdem_file=refdem_file
+            refdem_file = refdem_file
         )
 
         # Rasterize point clouds
-        pc_files = sorted(glob(os.path.join(final_stereo_folder, '*', '*PC.tif')))
+        print('\nRasterizing point clouds')
         ortho_utils.rasterize_point_clouds(
-            pc_files,
+            pc_files = sorted(glob(os.path.join(final_stereo_folder, '*', '*PC.tif'))),
             t_res = output_res * 2,
+        )
+
+        # Align DSMs to reference DSM
+        ortho_utils.align_dems(
+            dem_files = sorted(glob(os.path.join(final_stereo_folder, '*', '*DEM.tif'))),
+            refdem_file = refdem_file,
+            max_displacement= 100,
             threads_string = threads
         )
 
-        # Mosaic DEMs
-        dem_files = sorted(glob(os.path.join(final_stereo_folder, '*', '*DEM.tif')))
+        # Mosaic DSMs
+        print('\nMosaicking DSMs')
         ortho_utils.mosaic_dems(
-            dem_files = dem_files,
-            output_file = os.path.join(final_stereo_folder, 'DEM_mosaic.tif'),
+            dem_files = sorted(glob(os.path.join(final_stereo_folder, '*', '*-trans_source.tif'))),
+            output_file = os.path.join(final_stereo_folder, 'DSM_mosaic.tif'),
             threads_string = threads
         )
 
-
+    print('\nDone! :)')
     
 if __name__ == '__main__':
     main()

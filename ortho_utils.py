@@ -1,10 +1,7 @@
 #! /usr/bin/env python
 
 """
-Utility functions for generating an orthoimage and/or DSM from video files for the Soo Locks project.
-
-Rainey Aberle
-2025
+Utility functions for generating an orthoimage from video files for the Soo Locks project.
 """
 
 import os
@@ -20,6 +17,7 @@ import rioxarray as rxr
 import xarray as xr
 import rasterio as rio
 import datetime
+import pyproj
 # Ignore warnings (rasterio throws a warning whenever an image is not georeferenced. Annoying in this case.)
 import warnings
 warnings.filterwarnings('ignore')
@@ -351,7 +349,7 @@ def determine_threads(
         threads = os.cpu_count()
     else:
         threads = int(threads_string)
-    print(f"Will use up to {threads} threads for each process.")
+    # print(f"Will use up to {threads} threads for each process.")
     return threads
 
 
@@ -561,16 +559,14 @@ def save_single_band_images(
     return
 
 
-def run_stereo(
+def match_features(
     image_files: list[str],
     camera_files: list[str],
     output_folder: str,
-    stop_point: int = None,
-    refdem_file: str = None,
     threads_string: str = 'all'
     ):
     """
-    Run stereo processing on pairs of images using Ames Stereo Pipeline's parallel_stereo.
+    Run stereo preprocessing on pairs of images using Ames Stereo Pipeline's parallel_stereo.
 
     Parameters
     ----------
@@ -580,10 +576,6 @@ def run_stereo(
         list of paths to camera model files corresponding to the images
     output_folder: str
         folder where the stereo outputs will be saved
-    stop_point: int
-        stop point for the stereo processing (if any)
-    refdem_file: str
-        path to reference DEM, required when image files are mapprojected (orthorectified)
     threads_string: str
         number of threads to use for parallel_stereo
 
@@ -643,16 +635,14 @@ def run_stereo(
                 "--threads-singleprocess", str(threads),
                 "--threads-multiprocess", str(threads),
                 "--nodata-value", "NaN",
+                '--alignment-method', 'none',
+                '--stop-point', '1',
                 im1, im2,
                 cam1, cam2,
                 pair_prefix,
             ]
-            if stop_point:
-                args += ["--stop-point", str(stop_point)]
-            if refdem_file:
-                args += [refdem_file]
 
-            print(f"Running stereo for ch{n1:02d}-ch{n2:02d}")
+            print(f"Running stereo preprocessing for ch{n1:02d}-ch{n2:02d}")
             log = run_cmd("parallel_stereo", args)
 
             # save log to file
@@ -699,7 +689,7 @@ def refine_cameras(
 
     # --- Run stereo preprocessing ---
     print("Running stereo pre-processing to create dense feature matches")
-    run_stereo(
+    match_features(
         image_files=image_files,
         camera_files=camera_files,
         output_folder=output_folder,
@@ -919,13 +909,102 @@ def update_tsai_intrinsics_to_full_fov(
     return
 
 
+def run_stereo(
+        image_files: list[str] = None,
+        camera_files: list[str] = None,
+        refdem_file: str = None,
+        output_folder: str = None,
+        threads_string: str = 'all'
+    ):
+    """
+    Run stereo processing on pairs of images using Ames Stereo Pipeline's parallel_stereo.
+
+    Parameters
+    ----------
+    image_files: list[str]
+        list of paths to image files
+    camera_files: list[str]
+        list of paths to camera model files corresponding to the images
+    refdem_file: str
+        path to the reference DEM file. Required if input images are mapprojected.
+    output_folder: str
+        folder where the stereo outputs will be saved
+    threads_string: str
+        number of threads to use for parallel_stereo
+
+    Returns
+    ----------
+    None
+    """
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Determine number of threads to use for parallel_stereo
+    threads = determine_threads(threads_string)
+    
+    # Extract numeric camera IDs (assumes pattern like "*ch01*", "*ch12*")
+    def get_cam_num(f):
+        base = os.path.basename(f)
+        try:
+            return int(base.split("ch")[1][:2])
+        except Exception:
+            raise ValueError(f"Could not parse camera number from filename: {base}")
+
+    # Map image -> camera number
+    im_numbers = [get_cam_num(f) for f in image_files]
+    print("Detected camera numbers:", im_numbers)
+
+    # Sort by camera number (in case input order isn’t sorted)
+    sorted_pairs = sorted(zip(im_numbers, image_files, camera_files), key=lambda x: x[0])
+    im_numbers, image_files, camera_files = zip(*sorted_pairs)
+
+    # Define image pairs
+    img1_list, img2_list = image_files[0:-1], image_files[1:]
+    cam1_list, cam2_list = camera_files[0:-1], camera_files[1:]
+
+    npairs = len(img1_list)
+    print(f"Found {npairs} total image pairs for stereo processing.")
+
+    # Iterate over image pairs
+    for i in tqdm(range(len(img1_list))):
+        img1, img2 = img1_list[i], img2_list[i]
+        cam1, cam2 = cam1_list[i], cam2_list[i]
+
+        # Define the output prefix
+        pair_prefix = os.path.join(
+            output_folder,
+            f"{os.path.splitext(os.path.basename(img1))[0]}__{os.path.splitext(os.path.basename(img2))[0]}",
+            "run",
+        )
+
+        # Construct the arguments
+        args = [
+            "--threads-singleprocess", str(threads),
+            "--threads-multiprocess", str(threads),
+            "--nodata-value", "NaN",
+            '--alignment-method', 'none',
+            img1, img2,
+            cam1, cam2,
+            pair_prefix,
+        ]
+        if refdem_file:
+            args += [refdem_file]
+
+        # print(f"Running stereo for image pair: {os.path.basename(img1)} and {os.path.basename(img2)}")
+        log = run_cmd("parallel_stereo", args)
+        # (log already saved to file, no need to save)
+
+    print('Stereo processing complete.')
+
+    return
+
+
 def rasterize_point_clouds(
         pc_files: list[str] = None, 
         t_res: float = 0.006,
-        threads_string: str = 'all'
+        t_crs: str = "EPSG:32619",
         ):
     """
-    Rasterize point clouds using Ames Stereo Pipeline's point2dem.
+    Rasterize point clouds by converting ECEF height in the point cloud to model space height.
 
     Parameters
     ----------
@@ -933,33 +1012,93 @@ def rasterize_point_clouds(
         list of paths to point cloud files
     t_res: float
         target resolution for the rasterized DEMs
-    threads_string: str
-        number of threads to use ('all' to use all available cores)
+    t_crs: str
+        EPSG code of the target CRS for the rasterized DEMs
 
     Returns
     ----------
     None
     """
-    print('Rasterizing point clouds')
 
-    # Determine number of threads to use
-    threads = determine_threads(threads_string)
-
-    # Iterate over point cloud files
+    # Iterate over point clouds
     for pc_file in tqdm(pc_files):
-        args = [
-            '--threads', str(threads),
-            '--tr', str(t_res),
-            pc_file
-        ]
-        log = run_cmd('point2dem', args)
-        log_prefix = os.path.splitext(pc_file)[0] + '_point2dem'
-        log_file = write_log_file(log, log_prefix)
+        # Define output file
+        pc_out_file = pc_file.replace('-PC.tif', '-DEM.tif')
+        
+        # Load point cloud DEM
+        dem = rxr.open_rasterio(pc_file).isel(band=2)
+        crs = dem.rio.crs
+
+        # Set no data values to NaN
+        dem = xr.where(dem==0, np.nan, dem)
+        dem = dem.rio.write_crs(crs)
+
+        # Resample to desired output resolution
+        dx, dy = dem.rio.resolution()
+        upscale_factor = np.mean([np.abs(t_res / dx), np.abs(t_res / dy)])
+        new_width = int(dem.rio.width * upscale_factor)
+        new_height = int(dem.rio.height * upscale_factor)
+        dem_resampled = dem.rio.reproject(
+            crs,
+            shape=(new_height, new_width),
+        ).rio.write_crs(crs)
+        
+        # Make sure it's in the target CRS
+        if f"EPSG:{crs.to_epsg()}" != t_crs:
+            dem_resampled = dem_resampled.rio.reproject(t_crs)
+
+        # Save new DEM
+        dem_resampled.rio.to_raster(pc_out_file)
+        print("Saved DEM:", pc_out_file)
 
     print('Rasterization of point clouds complete')
     return
 
 
+def align_dems(
+        dem_files: list[str] = None, 
+        refdem_file: str = None, 
+        max_displacement: float = 100, 
+        threads_string: str = 'all'
+        ) -> None:
+    """
+    Align DEM files to a reference DEM using Ames Stereo Pipeline's pc_align.
+
+    Parameters
+    ----------
+    dem_files: list[str]
+        list of paths to DEM files to be aligned
+    refdem_file: str
+        path to the reference DEM file
+    max_displacement: float
+        maximum allowed displacement in meters
+    threads_string: str
+        number of threads to use during pc_align
+        
+    Returns
+    ----------
+    None
+    """
+    
+    # Determine number of threads
+    threads = determine_threads(threads_string)
+
+    # Iterate over DEM files
+    for dem_file in tqdm(dem_files):
+        # construct args
+        args = [
+            '--max-displacement', str(max_displacement),
+            '--threads', str(threads),
+            '--save-transformed-source-points',
+            refdem_file, dem_file,
+            '-o', os.path.join(os.path.dirname(dem_file), 'pc_align_run')
+        ]
+        log = run_cmd('pc_align', args)
+        # (log already created by ASP, no need to save)
+
+    print('DEM alignment complete.')
+    return
+    
 def mosaic_dems(
         dem_files: list[str] = None,
         output_file: str = None,
@@ -995,9 +1134,8 @@ def mosaic_dems(
         '-o', output_file
     ] + dem_files
 
-    log = run_cmd('dem_mosaic', args)
-    log_prefix = os.path.join(output_folder, 'dem_mosaic')
-    log_file = write_log_file(log, log_prefix)
+    _ = run_cmd('dem_mosaic', args)
+    # (log already written to file by ASP, no need to save)
 
     print('DEM mosaicking complete.')
     return
