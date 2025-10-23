@@ -17,7 +17,7 @@ import rioxarray as rxr
 import xarray as xr
 import rasterio as rio
 import datetime
-import pyproj
+from p_tqdm import p_map
 # Ignore warnings (rasterio throws a warning whenever an image is not georeferenced. Annoying in this case.)
 import warnings
 warnings.filterwarnings('ignore')
@@ -390,27 +390,25 @@ def orthorectify(
 
     threads = determine_threads(threads_string)
 
-    # Iterate over files
+    # Construct the jobs
+    jobs_list = []
+    opts = [
+        '--threads', '1',
+        '--nodata-value', nodata_value,
+        '--tr', str(out_res)
+    ]
     for image_file, cam_file in zip(image_files, camera_files):
-        # Define output file name
         image_out_file = os.path.join(output_folder, os.path.basename(image_file))
+        job = opts + [refdem_file, image_file, cam_file, image_out_file]
+        jobs_list += [job]
+    
+    # Run the jobs in parallel
+    logs_list = p_map(run_cmd, ['mapproject']*len(jobs_list), jobs_list, num_cpus=threads)
+    logs_compiled = '\n'.join(logs_list)
 
-        # Set up and run command
-        print('\nOrthorectifying:', image_file)
-        args = [
-            '--threads', str(threads),
-            '--nodata-value', nodata_value,
-            '--tr', str(out_res),
-            refdem_file, image_file, cam_file, image_out_file
-        ]
-        log = run_cmd('mapproject', args)
-
-        # Save log to file
-        log_prefix = os.path.join(
-            output_folder, 
-            os.path.splitext(os.path.basename(image_file))[0] + '_mapproject'
-            )
-        _ = write_log_file(log, log_prefix)
+    # Save log to file
+    log_prefix = os.path.join(output_folder, 'compiled_mapproject_log')
+    _ = write_log_file(logs_compiled, log_prefix)
 
     print('Done orthorectifying.')
     return

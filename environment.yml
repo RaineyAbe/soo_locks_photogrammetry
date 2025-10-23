@@ -12,3 +12,4 @@ dependencies:
  - tqdm
  - pip:
     - opencv-python
+    - p_tqdm

@@ -10,7 +10,7 @@ Rainey Aberle, PhD<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical 
 
 1. Download [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 
-2. In the "Terminal" of Docker Desktop, pull the Docker image for this project:
+2. Open Docker Desktop and click on the "Terminal". Then, pull the Docker image for this project:
 
 `docker pull raineyaberle/soo_locks_photogrammetry`
 
@@ -24,6 +24,7 @@ Rainey Aberle, PhD<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical 
 
 1. Download video files from each camera and place them in a local folder. I recommend the following folder structure for easier running later:
 
+```
 .
 ├── ...
 ├── Soo_locks_photogrammetry    # Root folder for image processing
@@ -31,17 +32,18 @@ Rainey Aberle, PhD<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical 
 │   ├── inputs                  # Folder where results and imagery for individual sites will be saved
 │   └── outputs                 # Folder where all outputs from photogrammetry processing will be saved
 └── ...
+```
 
-
-2. In the Docker Terminal, define environment variables where your folders are. For example:
+2. In the Docker Terminal, define environment variables where your folders are and how many threads you want to use. Docker defaults to use only 2 CPU, so we have to tell it how much it's allowed to use. For example:
 
 ```
 VIDEOS_FOLDER=/Users/rdcrlrka/Research/Soo_locks_photogrammetry/videos
 INPUTS_FOLDER=/Users/rdcrlrka/Research/Soo_locks_photogrammetry/inputs
 OUTPUTS_FOLDER=/Users/rdcrlrka/Research/Soo_locks_photogrammetry/outputs
+CPU=12 
 ```
 
-3. Now, we'll start the Docker container with these local folders mounted:
+3. Now, we'll start the Docker container with your local folders mounted:
 
 ```
 docker run --rm -it \
@@ -50,7 +52,7 @@ docker run --rm -it \
 -v $OUTPUTS_FOLDER:/app/outputs \
 raineyaberle/soo_locks_photogrammetry
 ```
-This started a bash shell with all of the code, your local files, and required packages accessible. Your shell should now look something like:
+This starts a bash shell with all of the code, your local files, and required packages accessible. Your shell should now look something like:
 
 `(base) mambauser@875217d0f060:/app$`
 
@@ -61,11 +63,12 @@ python generate_orthoimage.py \
 -video_folder /app/videos \         # Keep this the same
 -inputs_folder /app/inputs \        # Keep this the same
 -output_folder /app/outputs \       # Keep this the same
--target_datetime 20251001171500     # REPLACE with the datetime you want to pull from the images
+-target_datetime 20251001171500     # REPLACE with the datetime you want to pull from the videos
 ```
 
 You should see folders and files being saved in your local outputs folder as the pipeline runs. For the full list of pipeline options, run: `python generate_orthoimage.py --help`
 
+NOTE: Docker Desktop puts limits on how much memory it is allowed to use by default. If you keep the thread usage of "all" when running "generate_orthoimage.py" and your allowed resources are lower, your job will be killed. To mitigate this, either go to your Docker Desktop Settings and increase the number of resources allowed, or run the pipeline with the "-threads 2" argument to decrease how many threads are used. 
 
 ## Steps in the pipeline under the hood
 
