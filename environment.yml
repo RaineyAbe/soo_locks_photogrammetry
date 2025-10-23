@@ -4,10 +4,11 @@ channels:
  - usgs-astrogeology
  - conda-forge
 dependencies:
+ - python=3.11
  - stereo-pipeline=3.5.0
- - pandas
+ - geopandas
  - gdal
  - rioxarray
  - tqdm
  - pip:
-   - opencv-python
+    - opencv-python

@@ -219,6 +219,7 @@ def main():
         )
 
         # Align DSMs to reference DSM
+        print('\nAligning DSMs with reference DSM')
         ortho_utils.align_dems(
             dem_files = sorted(glob(os.path.join(final_stereo_folder, '*', '*DEM.tif'))),
             refdem_file = refdem_file,

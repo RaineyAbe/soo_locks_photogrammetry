@@ -1,2 +1,9 @@
 *.DS_Store
 /__pycache__
+.config/dask/labextension.yaml
+.bash_history
+.bashrc
+.ipython/profile_default/*
+.jupyter/*
+.local/*
+.python_history
