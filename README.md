@@ -30,7 +30,7 @@ Rainey Aberle, PhD<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical 
 ├── Soo_locks_photogrammetry    # Root folder for image processing
 │   ├── videos                  # Folder containing your downloaded video files
 │   ├── inputs                  # Folder downloaded from RDEDrivePub containing required inputs
-│   └── outputs                 # Folder where all outputs from photogrammetry processing will be saved
+│   └── outputs                 # Folder where all outputs from the orthoimage pipeline will be saved
 └── ...
 ```
 
