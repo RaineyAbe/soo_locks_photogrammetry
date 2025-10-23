@@ -51,7 +51,7 @@ docker run --rm -it \
 -v $OUTPUTS_FOLDER:/app/outputs \
 raineyaberle/soo_locks_photogrammetry
 ```
-This starts a bash shell with all of the code, your local files, and required packages accessible. Your shell should now look something like:
+This starts a bash shell with all of the code, your local folders, and required packages accessible. Your shell should now look something like:
 
 `(base) mambauser@875217d0f060:/app$`
 
@@ -59,10 +59,10 @@ This starts a bash shell with all of the code, your local files, and required pa
 
 ```
 python generate_orthoimage.py \
+-target_datetime 20251001171500     # REPLACE with the datetime you want to pull from the videos
 -video_folder /app/videos \         # Keep this the same
 -inputs_folder /app/inputs \        # Keep this the same
 -output_folder /app/outputs \       # Keep this the same
--target_datetime 20251001171500     # REPLACE with the datetime you want to pull from the videos
 ```
 
 You should see folders and files being saved in your local outputs folder as the pipeline runs. For the full list of pipeline options, run: `python generate_orthoimage.py --help`
