@@ -40,7 +40,6 @@ Rainey Aberle, PhD<br>Email: Rainey.K.Aberle@erdc.dren.mil<br>Research Physical 
 VIDEOS_FOLDER=/Users/rdcrlrka/Research/Soo_locks_photogrammetry/videos
 INPUTS_FOLDER=/Users/rdcrlrka/Research/Soo_locks_photogrammetry/inputs
 OUTPUTS_FOLDER=/Users/rdcrlrka/Research/Soo_locks_photogrammetry/outputs
-CPU=12 
 ```
 
 3. Now, we'll start the Docker container with your local folders mounted:
