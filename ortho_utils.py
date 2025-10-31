@@ -18,6 +18,7 @@ import xarray as xr
 import rasterio as rio
 import datetime
 from p_tqdm import p_map
+import dask.array as da
 # Ignore warnings (rasterio throws a warning whenever an image is not georeferenced. Annoying in this case.)
 import warnings
 warnings.filterwarnings('ignore')

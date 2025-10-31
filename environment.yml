@@ -10,6 +10,7 @@ dependencies:
  - gdal
  - rioxarray
  - tqdm
+ - dask
  - pip:
     - opencv-python
     - p_tqdm
