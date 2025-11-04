@@ -19,6 +19,7 @@ import rasterio as rio
 import datetime
 from p_tqdm import p_map
 import dask.array as da
+import sys
 # Ignore warnings (rasterio throws a warning whenever an image is not georeferenced. Annoying in this case.)
 import warnings
 warnings.filterwarnings('ignore')
@@ -122,8 +123,7 @@ def string_to_datetime(
 def extract_frame_at_clock_time(
         video_file: str = None, 
         target_time_string: str = None, 
-        output_folder: str = None, 
-        output_format: str = 'tiff'
+        output_folder: str = None 
         ) -> bool:
     """
     Extract a single frame from a video file at the specified clock time.
@@ -136,8 +136,6 @@ def extract_frame_at_clock_time(
         target clock time in the format 'YYYYMMDD_HHMMSS'
     output_folder: str
         folder where the extracted frame will be saved
-    output_format: str
-        format to save the extracted frame (e.g., 'tiff', 'png', 'jpg')
 
     Returns
     ----------
@@ -195,16 +193,13 @@ def extract_frame_at_clock_time(
     # Save to file
     output_image_file = os.path.join(
         output_folder, 
-        f"ch{ch}_{target_time_string}.{output_format}"
+        f"ch{ch}_{target_time_string}.tiff"
         )
-    # determine save settings based on output format
-    save_params = []
-    if output_format == 'png':
-        save_params = [cv2.IMWRITE_PNG_COMPRESSION, 3]
-    elif output_format in ['jpg', 'jpeg']:
-        save_params = [cv2.IMWRITE_JPEG_QUALITY, 100]
+    
+    # make sure frame has int datatype
+    frame = frame.astype(np.int8)
 
-    if cv2.imwrite(output_image_file, frame, save_params):
+    if cv2.imwrite(output_image_file, frame):
         print(f"Extracted frame -> {output_image_file}")
         cap.release()
         return True
@@ -218,7 +213,6 @@ def process_video_files(
         video_files: list[str] = None, 
         target_time_string: str = None, 
         output_folder: str = None, 
-        output_format: str = 'tiff'
         ) -> None:
     """
     Extract frames from a list of video files at the specified clock time.
@@ -231,8 +225,6 @@ def process_video_files(
         target clock time in the format 'YYYYMMDD_HHMMSS'
     output_folder: str
         folder where the extracted frames will be saved
-    output_format: str
-        format to save the extracted frames (e.g., 'tiff', 'png', 'jpg')
 
     Returns
     ----------
@@ -244,7 +236,7 @@ def process_video_files(
 
     # Iterate over video files
     for video_file in video_files:
-        extract_frame_at_clock_time(video_file, target_time_string, output_folder, output_format)
+        extract_frame_at_clock_time(video_file, target_time_string, output_folder)
     return
 
 
@@ -306,11 +298,14 @@ def correct_initial_image_distortion(
             mask_undistorted = cv2.remap(mask, map1, map2, interpolation=cv2.INTER_NEAREST)
             # convert mask to boolean
             valid_mask = mask_undistorted > 0
-            # Now set invalid pixels to NaN
+            # Now set invalid pixels to 9999
             image_undistorted_nodata = image_undistorted.astype(np.float32)
-            image_undistorted_nodata[~valid_mask] = np.nan
+            image_undistorted_nodata[~valid_mask] = 9999
         else:
             image_undistorted = cv2.undistort(image, K, dist, None, K)
+
+        # Make sure datatype = Int
+        image_undistorted = np.array(image_undistorted, dtype=np.uint16)
 
         # Save to file
         if full_fov:
@@ -359,7 +354,7 @@ def orthorectify(
         camera_files: list[str] = None, 
         refdem_file: str = None, 
         output_folder: str = None,
-        nodata_value: str = 'NaN',
+        nodata_value: str = '9999',
         out_res: float = 0.003,
         threads_string: str = 'all'
         ) -> None:
@@ -396,6 +391,7 @@ def orthorectify(
     opts = [
         '--threads', '1',
         '--nodata-value', nodata_value,
+        '--ot', 'UInt16',
         '--tr', str(out_res)
     ]
     for image_file, cam_file in zip(image_files, camera_files):
@@ -408,7 +404,7 @@ def orthorectify(
     logs_compiled = '\n'.join(logs_list)
 
     # Save log to file
-    log_prefix = os.path.join(output_folder, 'compiled_mapproject_log')
+    log_prefix = os.path.join(output_folder, 'compiled_mapproject')
     _ = write_log_file(logs_compiled, log_prefix)
 
     print('Done orthorectifying.')
@@ -416,60 +412,57 @@ def orthorectify(
 
 
 def mosaic_orthoimages(
-        image_files: list[str] = None, 
-        closest_cam_map_file: str = None, 
-        output_folder: str = None
-        ) -> None:
+    image_files: list[str] = None, 
+    closest_cam_map_file: str = None, 
+    output_folder: str = None,
+    chunk_size: int = 1024
+) -> None:
     """
-    Mosaic orthorectified images based on a closest camera map.
+    Mosaic orthorectified images by sampling the closest_cam_map_file 
+    (now using Dask arrays to save on memory)
 
     Parameters
     ----------
-    image_files: list[str]
-        list of paths to orthorectified image files
-    closest_cam_map_file: str
-        path to the closest camera map file
-    output_folder: str
-        folder where the orthomosaic will be saved
-
-    Returns
-    ----------
-    None
+    image_files : list[str]
+        List of paths to orthorectified images
+    closest_cam_map_file : str
+        Path to the closest camera map
+    output_folder : str
+        Folder to save the mosaic
+    chunk_size : int
+        Chunk size for Dask arrays (default: 1024)
     """
     os.makedirs(output_folder, exist_ok=True)
 
-    # Load the map of closest camera
     print("Reading closest camera map")
-    closest_cam_map = rxr.open_rasterio(closest_cam_map_file)
+    closest_cam_map = rxr.open_rasterio(closest_cam_map_file, chunks=chunk_size)
     crs = closest_cam_map.rio.crs
 
-    # Load orthoimages
-    print("Reading orthoimages")
-    datasets = [rxr.open_rasterio(f, masked=True) for f in image_files]
+    print("Reading orthoimages with Dask")
+    datasets = [rxr.open_rasterio(f, masked=True, chunks=chunk_size) for f in image_files]
 
     # Verify consistent CRS
     for ds in datasets:
         if ds.rio.crs != crs:
-            raise ValueError(f"CRS mismatch in {ds.rio.nodata}")
+            raise ValueError(f"CRS mismatch in {ds.rio.crs}")
 
-    # Determine number of bands (use from first image)
     num_bands = datasets[0].rio.count
     print(f"Detected {num_bands} band(s) per image")
 
-    # Determine target resolution (average or min pixel size)
+    # Determine target resolution
     res_x = np.mean([abs(ds.rio.resolution()[0]) for ds in datasets])
     res_y = np.mean([abs(ds.rio.resolution()[1]) for ds in datasets])
-    print(f"Using target resolution: {res_x:.3f}, {res_y:.3f}")
+    print(f"Target resolution: {res_x:.3f}, {res_y:.3f}")
 
-    # Determine output bounds and grid
+    # Output bounds & transform
     bounds = closest_cam_map.rio.bounds()
     width = int((bounds[2] - bounds[0]) / res_x)
     height = int((bounds[3] - bounds[1]) / res_y)
     transform = rio.transform.from_bounds(*bounds, width=width, height=height)
 
-    # Create a dummy grid (reference for reprojection)
+    # Dummy grid
     dummy_grid = xr.DataArray(
-        np.nan*np.zeros((height, width), dtype=np.uint8),
+        da.full((height, width), np.nan, dtype=np.float32, chunks=(chunk_size, chunk_size)),
         dims=("y", "x"),
         coords={
             "y": np.linspace(bounds[3], bounds[1], height),
@@ -477,42 +470,43 @@ def mosaic_orthoimages(
         },
     ).rio.write_crs(crs).rio.write_transform(transform)
 
-    # Reproject images
+    # Reproject images lazily with dask
     print("Reprojecting images to target grid...")
     reprojected = [
         ds.rio.reproject_match(dummy_grid, resampling=rio.enums.Resampling.nearest)
         for ds in datasets
     ]
 
-    # Stack all reprojected images along a "camera" dimension
     stack = xr.concat(reprojected, dim="camera")
 
-    # Reproject closest_cam_map
-    print("Reprojecting closest_cam_map to target grid...")
+    # Reproject closest_cam_map lazily
     closest_cam_map = closest_cam_map.rio.reproject_match(dummy_grid, resampling=rio.enums.Resampling.nearest)
 
-    # Initialize mosaic with NaNs for all bands
-    print("Creating mosaic...")
+    # Initialize mosaic with dask array
+    print("Creating mosaic")
     mosaic_shape = (num_bands, height, width)
     mosaic = xr.DataArray(
-        np.full(mosaic_shape, np.nan, dtype=np.float32),
+        da.full(mosaic_shape, np.nan, dtype=np.int16, chunks=(1, chunk_size, chunk_size)),
         dims=("band", "y", "x"),
         coords={"band": np.arange(1, num_bands + 1), "y": dummy_grid.y, "x": dummy_grid.x},
     ).rio.write_crs(crs).rio.write_transform(transform)
 
-    # Fill mosaic by selecting pixels based on closest_cam_map
+    # Fill mosaic lazily using dask.where
     for i in range(len(stack.camera)):
-        mask = closest_cam_map.squeeze() == i
+        mask = (closest_cam_map.squeeze() == i)
         if num_bands == 1:
             mosaic = xr.where(mask, stack.isel(camera=i)[0], mosaic)
         else:
             for b in range(num_bands):
                 mosaic[b] = xr.where(mask, stack.isel(camera=i, band=b), mosaic[b])
+    
+    # Make sure dimensions are in correct order
+    mosaic = mosaic.transpose('band', 'y', 'x')
 
-    # Save mosaic
-    os.makedirs(output_folder, exist_ok=True)
-    mosaic_file = os.path.join(output_folder, "orthomosaic.tif")
-    mosaic.rio.to_raster(mosaic_file)
+    # Save mosaic (compute in chunks)
+    mosaic_file = os.path.join(output_folder, "orthomosaic.tiff")
+    print("Saving mosaic...")
+    mosaic.rio.to_raster(mosaic_file, compute=True)
     print("Saved orthomosaic:", mosaic_file)
     return
 
@@ -538,7 +532,7 @@ def save_single_band_images(
     os.makedirs(output_folder, exist_ok=True)
 
     # Iterate over image files
-    for image_file in tqdm(image_files):
+    for image_file in tqdm(image_files, file=sys.stdout):
         # convert images to single band
         out_fn = os.path.join(output_folder, os.path.basename(image_file))
         if os.path.exists(out_fn):
@@ -829,7 +823,7 @@ def update_tsai_intrinsics_to_full_fov(
     cam_files = sorted(glob(os.path.join(ba_cam_folder, '*.tsai')))
 
     # Iterate over rows
-    for _, row in tqdm(params.iterrows(), total=len(params)):
+    for _, row in tqdm(params.iterrows(), total=len(params), file=sys.stdout):
         camera = row['camera']
         if camera < 10:
             ch = 0 + str(camera)
@@ -964,7 +958,7 @@ def run_stereo(
     print(f"Found {npairs} total image pairs for stereo processing.")
 
     # Iterate over image pairs
-    for i in tqdm(range(len(img1_list))):
+    for i in tqdm(range(len(img1_list)), file=sys.stdout):
         img1, img2 = img1_list[i], img2_list[i]
         cam1, cam2 = cam1_list[i], cam2_list[i]
 
@@ -1020,7 +1014,7 @@ def rasterize_point_clouds(
     """
 
     # Iterate over point clouds
-    for pc_file in tqdm(pc_files):
+    for pc_file in tqdm(pc_files, file=sys.stdout):
         # Define output file
         pc_out_file = pc_file.replace('-PC.tif', '-DEM.tif')
         
@@ -1083,7 +1077,7 @@ def align_dems(
     threads = determine_threads(threads_string)
 
     # Iterate over DEM files
-    for dem_file in tqdm(dem_files):
+    for dem_file in tqdm(dem_files, file=sys.stdout):
         # construct args
         args = [
             '--max-displacement', str(max_displacement),

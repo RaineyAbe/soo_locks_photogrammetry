@@ -1,7 +1,8 @@
 #! /usr/bin/env python
 
 """
-Pipeline for constructing an orthoimage and/or digital surface model from video files for the Soo Locks project.
+Pipeline for constructing an orthoimage and/or digital surface model from image or video files for the Soo Locks project. 
+Only the video_folder OR image_folder argument required. 
 
 Usage: 
 ----------
@@ -14,6 +15,7 @@ python generate_orthoimage.py \
 -output_res 0.003 \
 -threads "all" \
 -generate_dsm <0/1>
+
 """
 
 import argparse
@@ -29,8 +31,9 @@ import ortho_utils
 
 def getparser():
     parser = argparse.ArgumentParser(description='Wrapper script to pull video frames and generate orthoimage for the Soo Locks project.')
-    parser.add_argument('-video_folder', default=None, type=str, help='path to folder containing video files')
+    parser.add_argument('-video_folder', default=None, type=str, help='path to folder containing video files (only video OR image folder needed)')
     parser.add_argument('-target_datetime', default=None, type=str, help='datetime at which to pull video frames')
+    parser.add_argument('-image_folder', default=None, type=str, help='path to folder containing image files (only video OR image folder needed)')
     parser.add_argument('-inputs_folder', default=None, type=str, help='path to folder containing standard input files')
     parser.add_argument('-output_folder', default=None, type=str, help='path to folder where all outputs will be saved')
     parser.add_argument('-refine_cameras', default=0, type=int, choices=[0,1], help='whether to refine the pre-optimized cameras')
@@ -46,6 +49,7 @@ def main():
     args = parser.parse_args()
     video_folder = args.video_folder
     target_datetime = args.target_datetime
+    image_folder = args.image_folder
     inputs_folder = args.inputs_folder
     output_folder = args.output_folder
     refine_cameras = bool(args.refine_cameras)
@@ -56,7 +60,6 @@ def main():
     # --- Define output folders ---
     out_folder = os.path.join(output_folder, 'soo_locks_photogrammetry_' + target_datetime)
     os.makedirs(out_folder, exist_ok=True)
-    image_folder = os.path.join(out_folder, 'images')
     undistorted_image_folder = os.path.join(out_folder, 'undistorted_images')
     ortho_folder = os.path.join(out_folder, 'orthoimages')
     # folders for refining cameras
@@ -98,6 +101,7 @@ def main():
     distortion_params_file = os.path.join(inputs_folder, 'initial_undistortion_params.csv')
     camera_folder = os.path.join(inputs_folder, 'calibrated_cameras')
     closest_cam_map_file = os.path.join(inputs_folder, 'closest_camera_map.tiff')
+
     # Make sure they exist
     if not os.path.exists(inputs_folder):
         raise FileNotFoundError(f'Inputs folder not found: {inputs_folder}')
@@ -109,17 +113,33 @@ def main():
         raise FileNotFoundError(f'Camera folder not found: {camera_folder}')
     if not os.path.exists(closest_cam_map_file):
         raise FileNotFoundError(f'Closest camera map file not found: {closest_cam_map_file}')
-
+    
+    # Make sure only image or video folder is specified, and that they exist
+    if (video_folder is None) and (image_folder is None):
+        raise ValueError('Either video_folder or image_folder must be specified.')
+    if (video_folder is not None) and (image_folder is not None):
+        raise ValueError('Only one of video_folder or image_folder should be specified.')
+    if video_folder is not None:
+        if not os.path.exists(video_folder):
+            raise FileNotFoundError(f'Video folder not found: {video_folder}')
+        if not target_datetime:
+            raise ValueError("target_datetime must be specified when inputting video files.")
+    if image_folder is not None:
+        if not os.path.exists(image_folder):
+            raise FileNotFoundError(f'Image folder not found: {image_folder}')
 
     # --- Run the workflow ---
-    print('\n------------------------------------------')
-    print('--- EXTRACTING FRAMES FROM VIDEO FILES ---')
-    print('------------------------------------------\n')
-    ortho_utils.process_video_files(
-        video_files = sorted(glob(os.path.join(video_folder, '*.avi'))), 
-        target_time_string = target_datetime,
-        output_folder = image_folder
-    )
+    if video_folder:
+        print('\n------------------------------------------')
+        print('--- EXTRACTING FRAMES FROM VIDEO FILES ---')
+        print('------------------------------------------\n')
+        image_folder = os.path.join(out_folder, 'images')
+        ortho_utils.process_video_files(
+            video_files = sorted(glob(os.path.join(video_folder, '*.avi'))), 
+            target_time_string = target_datetime,
+            output_folder = image_folder
+        )
+
 
     print('\n-------------------------------------------')
     print('--- CORRECTING INITIAL IMAGE DISTORTION ---')
