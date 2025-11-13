@@ -5,7 +5,7 @@
 BASE_PATH="/Users/rdcrlrka/Research/Soo_locks"
 
 # Run the pipeline
-python generate_orthoimage.py \
+python ${BASE_PATH}/soo_locks_photogrammetry/generate_orthoimage.py \
 -video_folder "${BASE_PATH}/20251001_imagery/video" \
 -target_datetime "20251001171000" \
 -inputs_folder "${BASE_PATH}/inputs" \
