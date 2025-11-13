@@ -6,92 +6,21 @@ Utility functions for generating an orthoimage from video files for the Soo Lock
 
 import os
 from glob import glob
-import subprocess
 import numpy as np
-from tqdm import tqdm
-import pandas as pd
 import cv2
-import shutil
-import ast
 import rioxarray as rxr
 import xarray as xr
 import rasterio as rio
 import datetime
-from p_tqdm import p_map
 import dask.array as da
-import sys
+import geopandas as gpd
+import pandas as pd
+import matplotlib.pyplot as plt
+from ast import literal_eval
+import json
 # Ignore warnings (rasterio throws a warning whenever an image is not georeferenced. Annoying in this case.)
 import warnings
 warnings.filterwarnings('ignore')
-
-
-def run_cmd(
-        bin: str = None, 
-        args: list = None, **kw
-        ) -> str:
-    """
-    Wrapper for subprocess function to execute bash commands.
-
-    Parameters
-    ----------
-    bin: str
-        command to be excuted (e.g., "mapproject")
-    args: list
-        arguments to the command as a list
-    
-    Returns
-    ----------
-    out: str
-        log (stdout) as str if the command executed, error message if the command failed
-    """
-    binpath = shutil.which(bin)
-    call = [binpath,]
-    if args is not None: 
-        call.extend(args)
-    try:
-        out = subprocess.run(call,check=True,capture_output=True,encoding='UTF-8').stdout
-    except:
-        out = f"the command {call} failed to run, see corresponding log"
-    return out
-
-
-def write_log_file(
-        log: str = None, 
-        output_prefix: str = None
-        ) -> str:
-    """
-    Write a log string to a text file with a timestamped name.
-
-    Parameters
-    ----------
-    log: str
-        log string to be written to file
-    output_prefix: str
-        prefix for the output log file name
-
-    Returns
-    ----------
-    log_file: str
-        path to the written log file
-    """
-    # create a string of the current datetime
-    now_string = (
-        str(datetime.datetime.now())
-        .replace('-','')
-        .replace(' ','')
-        .replace(':','')
-        .replace('.','')
-    )
-
-    # create output file name
-    log_file = output_prefix + '_log_' + now_string + '.txt'
-
-    # write to file
-    with open(log_file, 'w') as f:
-        f.write(log)
-    print('Saved log:', log_file)
-
-    return log_file
 
 
 def string_to_datetime(
@@ -240,186 +169,361 @@ def process_video_files(
     return
 
 
-def correct_initial_image_distortion(
-        params_file: str = None, 
-        image_files: list[str] = None, 
-        output_folder: str = None,
-        full_fov: bool = True
-        ) -> None:
-    """
-    Correct initial image distortion using pre-computed distortion parameters.
+class GCPSelector:
+    def __init__(self, img1_file, img2_file, gcp1, zoom=100):
+        # Load grayscale images
+        self.img1_file = img1_file
+        self.img1 = plt.imread(img1_file)
+        if self.img1.ndim == 3:
+            self.img1 = np.mean(self.img1, axis=2)
+        self.img2_file = img2_file
+        self.img2 = plt.imread(img2_file)
+        if self.img2.ndim == 3:
+            self.img2 = np.mean(self.img2, axis=2)
 
-    Parameters
-    ----------
-    params_file: str
-        path to CSV file containing distortion parameters
-    image_files: list[str]
-        list of paths to image files to be undistorted
-    output_folder: str
-        folder where the undistorted images will be saved
-    full_fov: bool
-        whether to undistort to full field of view
+        self.gcp1 = gcp1
+        self.gcp2 = gcp1.copy()
+        self.zoom = zoom
+        self.clicked_points = [None] * len(self.gcp2)
+        self.current_index = 0
 
-    Returns
-    ----------
-    None
-    """
-    os.makedirs(output_folder, exist_ok=True)
+        # Setup figure
+        self.fig, (self.ax1, self.ax2) = plt.subplots(1, 2, figsize=(10, 5))
+        self.cid_click = self.fig.canvas.mpl_connect('button_press_event', self.onclick)
+        self.cid_key = self.fig.canvas.mpl_connect('key_press_event', self.onkey)
 
-    # Load the camera and distortion parameters file
-    params = pd.read_csv(params_file)
-    params['K'] = params['K'].apply(ast.literal_eval)
-    params['K_full'] = params['K_full'].apply(ast.literal_eval)
-    params['dist'] = params['dist'].apply(ast.literal_eval)
+        print(
+            "Instructions:\n"
+            " - Click on the right image to record a new GCP location.\n"
+            " - Press 'k' to skip if feature not visible.\n"
+            " - Press 'b' to go back and redo previous GCP.\n"
+        )
 
-    # Iterate over image files
-    for image_file in image_files:
-        # Read image
-        image = cv2.imread(image_file, cv2.IMREAD_UNCHANGED)
-        h,w = image.shape[:2]
+        self.update_display()
+        plt.show()
 
-        # Determine the camera number
-        ch = os.path.basename(image_file).split('_')[0][2:]
+    def update_display(self):
+        """Show zoomed-in patches around current GCP"""
+        if self.current_index >= len(self.gcp1):
+            print("All GCPs processed.")
+            plt.close(self.fig)
+            return
 
-        # Get the respective distortion parameters
-        params_im = params.loc[params['camera']==int(ch)].reset_index().iloc[0]
-        K = np.array(params_im['K']).reshape(3,3)
-        K_full = np.array(params_im['K_full']).reshape(3,3)
-        dist = np.array(params_im['dist']).reshape(-1,1)
+        # Clear axes
+        self.ax1.clear()
+        self.ax2.clear()
 
-        # Undistort
-        if full_fov:
-            # must do some remapping to maintain no data values
-            map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, K_full, (w, h), cv2.CV_32FC1)
-            # apply undistortion to the image
-            image_undistorted = cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR)
-            # create a white mask and remap it the same way to find valid areas
-            mask = np.ones((h, w), dtype=np.uint8) * 255
-            mask_undistorted = cv2.remap(mask, map1, map2, interpolation=cv2.INTER_NEAREST)
-            # convert mask to boolean
-            valid_mask = mask_undistorted > 0
-            # Now set invalid pixels to 9999
-            image_undistorted_nodata = image_undistorted.astype(np.float32)
-            image_undistorted_nodata[~valid_mask] = 9999
+        u, v = self.gcp1.iloc[self.current_index][['col_sample','row_sample']]
+        u, v = int(u), int(v)
+        half = self.zoom
+
+        # Crop images to around GCP
+        x1, x2 = max(0, u - half), min(self.img1.shape[1], u + half)
+        y1, y2 = max(0, v - half), min(self.img1.shape[0], v + half)
+        crop1 = self.img1[y1:y2, x1:x2]
+        crop2 = self.img2[y1:y2, x1:x2]
+
+        # Show zoomed-in crops
+        self.ax1.imshow(crop1, cmap='gray', extent=[x1, x2, y2, y1])
+        self.ax1.set_title(f"Original GCP #{self.current_index}")
+        self.ax1.plot(u, v, 'om', markersize=6)
+
+        self.ax2.imshow(crop2, cmap='gray', extent=[x1, x2, y2, y1])
+        self.ax2.set_title("Click New Location")
+
+        self.fig.suptitle(self.img2_file)
+
+        for ax in [self.ax1, self.ax2]:
+            ax.set_xlim(u - half, u + half)
+            ax.set_ylim(v + half, v - half)
+
+        self.fig.canvas.draw()
+
+    def onclick(self, event):
+        if event.inaxes != self.ax2:
+            return
+        u, v = event.xdata, event.ydata
+        self.clicked_points[self.current_index] = (u, v)
+        self.gcp2.loc[self.current_index, ['col_sample', 'row_sample']] = u, v
+        self.current_index += 1
+        self.update_display()
+
+    def onkey(self, event):
+        """Handle keyboard shortcuts"""
+        if event.key == 'k':  # skip
+            self.clicked_points[self.current_index] = None
+            self.current_index += 1
+            self.update_display()
+        elif event.key == 'b':  # back
+            if self.current_index > 0:
+                self.current_index -= 1
+                self.update_display()
+        elif event.key == 'q':
+            print("User quit early.")
+            plt.close(self.fig)
+
+    def get_results(self, out_file=None):
+        """Return/save GCP2 with updated pixel coordinates, with skipped GCPs as NaN"""
+        gcp2 = self.gcp2
+        gcp2 = gcp2.dropna().reset_index(drop=True)
+        # print(f"Compiled {len(gcp2)} updated GCPs")
+
+        if out_file:
+            gcp2.to_file(out_file)
+            print(f'Updated GCP saved to:\n{out_file}')
+
+        return gcp2
+
+
+def solve_new_pose(gcp_df, K, D, rvec1, tvec1):
+    # Prepare GCPs and image points
+    obj_pts = gcp_df[['X', 'Y', 'Z']].values.astype(np.float32)
+    img_pts = gcp_df[['col_sample', 'row_sample']].values.astype(np.float32)
+
+    # Undistort the image points
+    img_pts_undistorted = cv2.fisheye.undistortPoints(
+        img_pts.reshape(-1, 1, 2), K, D, None, K
+    ).reshape(-1, 2)
+
+    # Convert rvec1, tvec1 to rotation matrix
+    R1, _ = cv2.Rodrigues(rvec1)
+    tvec1 = tvec1.reshape(3, 1)
+
+    # Project GCPs into the camera frame using initial pose
+    # world -> camera
+    obj_cam = (R1 @ obj_pts.T + tvec1).T
+
+    # Triangulate new camera-frame coordinates based on observed pixels
+    # Backproject undistorted pixels into 3D rays, then scale by depth of old model
+    pts_cam_dir = np.concatenate([img_pts_undistorted, np.ones((len(img_pts_undistorted), 1))], axis=1)
+    pts_cam_dir = np.linalg.inv(K) @ pts_cam_dir.T
+    pts_cam_dir = pts_cam_dir.T
+
+    # Use existing depths from old pose to approximate new camera-frame coordinates
+    depths = obj_cam[:, 2:3]
+    obj_cam_new = pts_cam_dir * depths
+
+    # Compute best-fit rigid transform (dR, dt) between obj_cam_new and obj_cam
+    mu_old = obj_cam.mean(axis=0)
+    mu_new = obj_cam_new.mean(axis=0)
+    X0 = obj_cam - mu_old
+    X1 = obj_cam_new - mu_new
+
+    U, _, Vt = np.linalg.svd(X0.T @ X1)
+    R_delta = Vt.T @ U.T
+    if np.linalg.det(R_delta) < 0:  # ensure a right-handed rotation
+        Vt[-1, :] *= -1
+        R_delta = Vt.T @ U.T
+    t_delta = mu_new - R_delta @ mu_old
+
+    # Construct new pose
+    R2 = R_delta @ R1
+    tvec2 = R_delta @ tvec1 + t_delta.reshape(3, 1)
+    rvec2, _ = cv2.Rodrigues(R2)
+
+    return rvec2, tvec2
+
+
+def refine_camera_poses(image_files, init_image_files, init_cams_file, init_gcp_file, out_folder):
+
+    os.makedirs(out_folder, exist_ok=True)
+
+    # Load initial GCPs
+    gcp = gpd.read_file(init_gcp_file, layer='gcp_merged_stable')
+    gcp = gcp.dropna().reset_index(drop=True)
+    gcp['channel'] = [f"ch0{ch}" if ch < 10 else f"ch{ch}" for ch in gcp['channel']]
+
+    # Load initial camera specs
+    init_cams = pd.read_csv(init_cams_file)
+    for k in ['K', 'D', 'K_full', 'rvec', 'tvec']:
+        init_cams[k] = init_cams[k].apply(literal_eval)
+        
+    # Iterate over images
+    for i, image_file in enumerate(image_files):
+        # Check if output file already exists
+        ch = "ch" + os.path.basename(image_file).split('ch')[1][0:2]
+        new_cam_file = os.path.join(out_folder, f"{ch}_refined_camera.csv")
+        if os.path.exists(new_cam_file):
+            print('Refined camera pose already exists in file, skipping.')
+            continue
+
+        # Get the original image
+        init_image_file = [x for x in init_image_files if ch in os.path.basename(x)][0]
+
+        # Subset the initial GCP
+        init_gcp = gcp.loc[gcp['channel']==ch]
+
+        # Get camera intrinsics
+        init_cam = init_cams.loc[init_cams['channel']==ch]
+        K = np.array(init_cam['K'].values[0])
+        D = np.array(init_cam['D'].values[0])
+        K_full = np.array(init_cam['K_full'].values[0])
+        rvec1 = np.array(init_cam['rvec'].values[0])
+        tvec1 = np.array(init_cam['tvec'].values[0])
+
+        # Check if updated GCP already exist
+        new_gcp_file = os.path.join(out_folder, f"{ch}_updated_GCP.gpkg")
+        if not os.path.exists(new_gcp_file):
+
+            # Run interactive GCP selection
+            selector = GCPSelector(
+                init_image_file, image_file, init_gcp, zoom=100
+            )
+
+            # Get the updated GCP
+            new_gcp = selector.get_results(out_file=new_gcp_file)
         else:
-            image_undistorted = cv2.undistort(image, K, dist, None, K)
+            new_gcp = gpd.read_file(new_gcp_file)
 
-        # Make sure datatype = Int
-        image_undistorted = np.array(image_undistorted, dtype=np.uint16)
+        # Refine camera pose
+        rvec2, tvec2 = solve_new_pose(
+            new_gcp, K, D, rvec1, tvec1
+        )
 
-        # Save to file
-        if full_fov:
-            image_undistorted_file = os.path.join(
-                output_folder, 
-                os.path.splitext(os.path.basename(image_file))[0] + '_undistorted_full_fov.tiff'
-                )
-        else:
-            image_undistorted_file = os.path.join(
-                output_folder, 
-                os.path.splitext(os.path.basename(image_file))[0] + '_undistorted_cropped_fov.tiff'
-                )
-        cv2.imwrite(image_undistorted_file, image_undistorted)
-        print('\nSaved undistorted image:', image_undistorted_file)
-    
-    print('\nInitial undistortion complete.')
-    return
+        # Save new camera specs
+        new_cam = pd.DataFrame({
+            'channel': [ch],
+            'K': [json.dumps(K.tolist())],
+            'D': [json.dumps(D.tolist())],
+            'K_full': [json.dumps(K_full.tolist())],
+            'rvec': [json.dumps(rvec2.tolist())],
+            'tvec': [json.dumps(tvec2.tolist())]
+        }, index=[i])
+        new_cam.to_csv(new_cam_file, index=False)
+        print(f'Refined camera saved to:\n{new_cam_file}')
+        
+    # Merge refined cameras into one file
+    new_cam_files = glob(os.path.join(out_folder, '*refined_camera.csv'))
+    new_cams_list = []
+    for new_cam_file in new_cam_files:
+        new_cams_list += [pd.read_csv(new_cam_file)]
+    new_cams = pd.concat(new_cams_list).reset_index(drop=True)
+    new_cams_file = os.path.join(out_folder, "refined_cameras_merged.csv")
+    new_cams.to_csv(new_cams_file, index=False)
+    print(f'Merged refined cameras and saved to:\n{new_cams_file}')
 
+    # Remove intermediary files
+    # for new_cam_file in new_cam_files:
+    #     os.remove(new_cam_file)
 
-def determine_threads(
-        threads_string: str = "all"
-        ) -> int:
-    """
-    Parse the number of threads to use from a string. 
-
-    Parameters
-    ----------
-    threads_string: str
-        number of threads to use. options: string containing a number, or "all".
-
-    Returns
-    ----------
-    threads: int
-        number of threads as an integer.
-    """
-    if threads_string=='all':
-        threads = os.cpu_count()
-    else:
-        threads = int(threads_string)
-    # print(f"Will use up to {threads} threads for each process.")
-    return threads
+    return new_cams_file
 
 
-def orthorectify(
-        image_files: list[str] = None, 
-        camera_files: list[str] = None, 
-        refdem_file: str = None, 
-        output_folder: str = None,
-        nodata_value: str = '9999',
-        out_res: float = 0.003,
-        threads_string: str = 'all'
-        ) -> None:
-    """
-    Orthorectify images using the Ames Stereo Pipeline's mapproject function and a reference DEM.
+def undistort_image(img, K, D, K_full, mask_nodata=True):
+    # Undistort with full FOV
+    h,w = img.shape
+    map1, map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K_full, (w,h), cv2.CV_32FC1)
+    img_undistorted = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
-    Parameters
-    ----------
-    image_files: list[str]
-        list of paths to image files to be orthorectified
-    camera_files: list[str]
-        list of paths to camera model files corresponding to the images
-    refdem_file: str
-        path to the reference DEM file
-    output_folder: str
-        folder where the orthorectified images will be saved
-    nodata_value: str
-        nodata value to use in the output orthorectified images
-    out_res: float
-        output pixel resolution in meters
-    threads_string: str
-        number of threads to use during mapproject
-    
-    Returns
-    ----------
-    None
-    """
-    os.makedirs(output_folder, exist_ok=True)
+    # Mask invalid pixels
+    if mask_nodata:
+        mask = np.ones((h, w), dtype=np.uint8) * 255
+        mask_undistorted = cv2.remap(mask, map1, map2, interpolation=cv2.INTER_NEAREST)
+        valid_mask = mask_undistorted > 0
+        img_undistorted = img_undistorted.astype(np.float32)
+        img_undistorted[~valid_mask] = np.nan
 
-    threads = determine_threads(threads_string)
+    return img_undistorted
 
-    # Construct the jobs
-    jobs_list = []
-    opts = [
-        '--threads', '1',
-        '--nodata-value', nodata_value,
-        '--ot', 'UInt16',
-        '--tr', str(out_res)
-    ]
-    for image_file, cam_file in zip(image_files, camera_files):
-        image_out_file = os.path.join(output_folder, os.path.basename(image_file))
-        job = opts + [refdem_file, image_file, cam_file, image_out_file]
-        jobs_list += [job]
-    
-    # Run the jobs in parallel
-    logs_list = p_map(run_cmd, ['mapproject']*len(jobs_list), jobs_list, num_cpus=threads)
-    logs_compiled = '\n'.join(logs_list)
 
-    # Save log to file
-    log_prefix = os.path.join(output_folder, 'compiled_mapproject')
-    _ = write_log_file(logs_compiled, log_prefix)
+def orthorectify(image_file, dem_file, K, D, K_full, rvec, tvec, out_file=None):
+    # Undistort the image
+    image = rxr.open_rasterio(image_file).isel(band=0).data
+    image_undistorted = undistort_image(image, K, D, K_full)
 
-    print('Done orthorectifying.')
-    return
+    # Build coordinate grid from DEM
+    dem = rxr.open_rasterio(dem_file).squeeze()
+    crs = dem.rio.crs
+    dem = xr.where(dem==-9999, np.nan, dem)
+    dem_z = dem.data.astype(np.float32)
+    X, Y = np.meshgrid(dem.x.data, dem.y.data)
+    h_img, w_img = image_undistorted.shape[:2]
+    ortho = np.full_like(dem_z, np.nan, dtype=np.float32)
+
+    # Calculate rotation matrix 
+    R, _ = cv2.Rodrigues(rvec)
+
+    # Flatten world points
+    world_pts = np.stack([X.ravel(), Y.ravel(), dem_z.ravel()], axis=1)
+
+    # Transform world→camera
+    cam_pts = (R @ world_pts.T + tvec).T
+
+    # Prevent divide-by-zero (points behind camera)
+    valid = cam_pts[:, 2] > 0
+
+    # Project onto image plane
+    uv = (K_full @ (cam_pts[valid].T / cam_pts[valid, 2])).T  # (N_valid,3)
+    u = uv[:, 0]
+    v = uv[:, 1]
+
+    # Fill map arrays
+    map_x = np.full_like(dem_z, np.nan, dtype=np.float32)
+    map_y = np.full_like(dem_z, np.nan, dtype=np.float32)
+    map_x.ravel()[valid] = u
+    map_y.ravel()[valid] = v
+
+    # Sample from the undistorted image
+    safe_map_x = map_x.copy()
+    safe_map_y = map_y.copy()
+    safe_map_x[np.isnan(safe_map_x)] = -1
+    safe_map_y[np.isnan(safe_map_y)] = -1
+
+    sampled = cv2.remap(
+        image_undistorted.astype(np.float32),
+        safe_map_x, safe_map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=np.nan
+    )
+
+    # Mask invalid or out-of-bounds regions
+    in_bounds = (
+        (map_x >= 0) & (map_x < w_img) &
+        (map_y >= 0) & (map_y < h_img)
+    )
+    ortho[in_bounds] = sampled[in_bounds]
+
+    # Return as xarray
+    ortho_xr = xr.DataArray(
+        ortho,
+        dims=('y', 'x'),
+        coords={'x': dem.x.data, 'y': dem.y.data}
+    )
+
+    # Remove totally empty rows and columns
+    ortho_xr = ortho_xr.dropna(dim='x', how='all').dropna(dim='y', how='all')
+
+    # Save to file
+    if out_file:
+        # convert datatype to int
+        nodata_val = 9999
+        ortho_xr = xr.where(np.isnan(ortho_xr), nodata_val, ortho_xr)
+        ortho_xr = ortho_xr.astype(np.uint16)
+        # assign CRS and nodata
+        ortho_xr = ortho_xr.rio.write_nodata(nodata_val)
+        ortho_xr = ortho_xr.rio.write_crs(crs)
+        # ensure orientation matches DEM (north-up)
+        if dem.rio.resolution()[1] < 0:
+            ortho_xr = ortho_xr.sortby('y', ascending=False)
+        # save with integer compression
+        ortho_xr.rio.to_raster(
+            out_file,
+            dtype='uint16'
+        )
+        print(f"Orthorectified image saved to:\n{out_file}")
+
+    return ortho_xr
 
 
 def mosaic_orthoimages(
     image_files: list[str] = None, 
     closest_cam_map_file: str = None, 
     output_folder: str = None,
-    chunk_size: int = 1024
+    chunk_size: int | str = 2048
 ) -> None:
     """
-    Mosaic orthorectified images by sampling the closest_cam_map_file 
-    (now using Dask arrays to save on memory)
+    Mosaic orthorectified images by sampling the closest_cam_map_file. 
 
     Parameters
     ----------
@@ -429,8 +533,8 @@ def mosaic_orthoimages(
         Path to the closest camera map
     output_folder : str
         Folder to save the mosaic
-    chunk_size : int
-        Chunk size for Dask arrays (default: 1024)
+    chunk_size : int | str
+        Chunk size for Dask arrays, passed to rioxarray.open_rasterio
     """
     os.makedirs(output_folder, exist_ok=True)
 
@@ -444,7 +548,7 @@ def mosaic_orthoimages(
     # Verify consistent CRS
     for ds in datasets:
         if ds.rio.crs != crs:
-            raise ValueError(f"CRS mismatch in {ds.rio.crs}")
+            ds = ds.rio.reproject(crs)
 
     num_bands = datasets[0].rio.count
     print(f"Detected {num_bands} band(s) per image")
@@ -462,7 +566,7 @@ def mosaic_orthoimages(
 
     # Dummy grid
     dummy_grid = xr.DataArray(
-        da.full((height, width), np.nan, dtype=np.float32, chunks=(chunk_size, chunk_size)),
+        da.full((height, width), 9999, dtype=np.uint16, chunks=(chunk_size, chunk_size)),
         dims=("y", "x"),
         coords={
             "y": np.linspace(bounds[3], bounds[1], height),
@@ -486,7 +590,7 @@ def mosaic_orthoimages(
     print("Creating mosaic")
     mosaic_shape = (num_bands, height, width)
     mosaic = xr.DataArray(
-        da.full(mosaic_shape, np.nan, dtype=np.int16, chunks=(1, chunk_size, chunk_size)),
+        da.full(mosaic_shape, 9999, dtype=np.uint16, chunks=(1, chunk_size, chunk_size)),
         dims=("band", "y", "x"),
         coords={"band": np.arange(1, num_bands + 1), "y": dummy_grid.y, "x": dummy_grid.x},
     ).rio.write_crs(crs).rio.write_transform(transform)
@@ -503,632 +607,14 @@ def mosaic_orthoimages(
     # Make sure dimensions are in correct order
     mosaic = mosaic.transpose('band', 'y', 'x')
 
+    # Make sure no data value, data type, and CRS are properly set
+    mosaic = mosaic.astype(np.uint16)
+    mosaic = mosaic.rio.write_nodata(9999)
+    mosaic = mosaic.rio.write_crs(crs)
+
     # Save mosaic (compute in chunks)
     mosaic_file = os.path.join(output_folder, "orthomosaic.tiff")
     print("Saving mosaic...")
     mosaic.rio.to_raster(mosaic_file, compute=True)
     print("Saved orthomosaic:", mosaic_file)
-    return
-
-
-def save_single_band_images(
-        image_files: list[str] = None, 
-        output_folder: str = None
-        ):
-    """
-    Save single-band versions of multi-band images.
-
-    Parameters
-    ----------
-    image_files: list[str]
-        list of paths to multi-band image files
-    output_folder: str
-        folder where the single-band images will be saved
-
-    Returns
-    ----------
-    None
-    """
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Iterate over image files
-    for image_file in tqdm(image_files, file=sys.stdout):
-        # convert images to single band
-        out_fn = os.path.join(output_folder, os.path.basename(image_file))
-        if os.path.exists(out_fn):
-            continue
-        args = [
-            "-b", "1",
-            image_file, out_fn
-        ]
-        log = run_cmd('gdal_translate', args)
-        write_log_file(
-            log, 
-            os.path.join(output_folder, 
-                         f"{os.path.splitext(os.path.basename(image_file))[0]}_gdal_translate")
-            )
-
-    print('Done saving single-band versions of all images.')
-    return
-
-
-def match_features(
-    image_files: list[str],
-    camera_files: list[str],
-    output_folder: str,
-    threads_string: str = 'all'
-    ):
-    """
-    Run stereo preprocessing on pairs of images using Ames Stereo Pipeline's parallel_stereo.
-
-    Parameters
-    ----------
-    image_files: list[str]
-        list of paths to image files
-    camera_files: list[str]
-        list of paths to camera model files corresponding to the images
-    output_folder: str
-        folder where the stereo outputs will be saved
-    threads_string: str
-        number of threads to use for parallel_stereo
-
-    Returns
-    ----------
-    None
-    """
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Determine number of threads to use for parallel_stereo
-    threads = determine_threads(threads_string)
-    
-    # Extract numeric camera IDs (assumes pattern like "*ch01*", "*ch12*")
-    def get_cam_num(f):
-        base = os.path.basename(f)
-        try:
-            return int(base.split("ch")[1][:2])
-        except Exception:
-            raise ValueError(f"Could not parse camera number from filename: {base}")
-
-    # Map image -> camera number
-    im_numbers = [get_cam_num(f) for f in image_files]
-    print("Detected camera numbers:", im_numbers)
-
-    # Sort by camera number (in case input order isn’t sorted)
-    sorted_pairs = sorted(zip(im_numbers, image_files, camera_files), key=lambda x: x[0])
-    im_numbers, image_files, camera_files = zip(*sorted_pairs)
-
-    # Define valid groups (1–8 and 9–16)
-    groups = []
-    group1 = [(n, im, cam) for n, im, cam in zip(im_numbers, image_files, camera_files) if 1 <= n <= 8]
-    group2 = [(n, im, cam) for n, im, cam in zip(im_numbers, image_files, camera_files) if 9 <= n <= 16]
-    if group1:
-        groups.append(group1)
-    if group2:
-        groups.append(group2)
-
-    total_pairs = 0
-
-    # Iterate over groups
-    for g_idx, group in enumerate(groups, start=1):
-        print(f"\nProcessing camera group {g_idx} ({group[0][0]}-{group[-1][0]})")
-        for (n1, im1, cam1), (n2, im2, cam2) in zip(group[:-1], group[1:]):
-            # Skip if cameras are not consecutive
-            if n2 != n1 + 1:
-                continue
-
-            # Define the output prefix
-            pair_prefix = os.path.join(
-                output_folder,
-                f"{os.path.splitext(os.path.basename(im1))[0]}__{os.path.splitext(os.path.basename(im2))[0]}",
-                "run",
-            )
-
-            # Construct the arguments
-            args = [
-                "--threads-singleprocess", str(threads),
-                "--threads-multiprocess", str(threads),
-                "--nodata-value", "NaN",
-                '--alignment-method', 'none',
-                '--stop-point', '1',
-                im1, im2,
-                cam1, cam2,
-                pair_prefix,
-            ]
-
-            print(f"Running stereo preprocessing for ch{n1:02d}-ch{n2:02d}")
-            log = run_cmd("parallel_stereo", args)
-
-            # save log to file
-            _ = write_log_file(log, pair_prefix)
-
-            total_pairs += 1
-
-    if total_pairs == 0:
-        print("No valid stereo pairs found.")
-    else:
-        print(f"Completed {total_pairs} stereo pairs successfully.")
-    return
-
-
-def refine_cameras(
-    image_files: list[str] = None,
-    camera_files: list[str] = None,
-    refdem_file: str = None,
-    output_folder: str = None,
-    threads_string: str = 'all'
-    ) -> None:
-    """
-    Refine camera models using bundle adjustment with Ames Stereo Pipeline's parallel_bundle_adjust.
-
-    Parameters
-    ----------
-    image_files: list[str]
-        list of paths to image files
-    camera_files: list[str]
-        list of paths to camera model files corresponding to the images
-    refdem_file: str
-        path to the reference DEM file
-    output_folder: str
-        folder where the refined camera models will be saved
-    threads_string: str
-        number of threads to use for parallel processes. 
-
-    Returns
-    ----------
-    None
-    """
-
-    os.makedirs(output_folder, exist_ok=True)
-
-    # --- Run stereo preprocessing ---
-    print("Running stereo pre-processing to create dense feature matches")
-    match_features(
-        image_files=image_files,
-        camera_files=camera_files,
-        output_folder=output_folder,
-        stop_point=1,  # only run pre-processing
-        threads_string=threads_string
-    )
-
-    # --- Collect match files ---
-    print("Collecting match files")
-    match_list = sorted(glob(os.path.join(output_folder, "*", "*.match")))
-    if not match_list:
-        raise RuntimeError("No .match files found in output folder. See relevant stereo logs.")
-
-    # Helper to extract camera number from filename
-    def get_cam_num(fname):
-        base = os.path.basename(fname)
-        try:
-            return int(base.split("ch")[1][:2])
-        except Exception:
-            raise ValueError(f"Could not parse camera number from: {base}")
-
-    # --- Copy matches into grouped run folders ---
-    print("Organizing match files into groups...")
-    group_match_files = {1: [], 2: []}
-
-    for match_file in match_list:
-        # Extract pair name from path: e.g. ".../img_ch01__img_ch02/run/matchfile"
-        pair = os.path.basename(os.path.dirname(match_file))  # e.g. "img_ch01__img_ch02"
-        chans = [int(x.split("ch")[1][:2]) for x in pair.split("__") if "ch" in x]
-
-        if not chans:
-            print(f"Could not determine cameras for: {match_file}")
-            continue
-
-        # Determine group from first channel number
-        first_channel = chans[0]
-        group = 1 if first_channel < 9 else 2
-
-        # Output file name: group prefix + original pair name
-        match_out_file = os.path.join(
-            output_folder,
-            f"run_group{group}-{pair}.match",
-        )
-        shutil.copy2(match_file, match_out_file)
-        group_match_files[group].append(match_out_file)
-
-    # --- Build group-wise image/camera lists from match files ---
-    # Determine number of threads to use
-    threads = determine_threads(threads_string)
-
-    print("Building image/camera sets from match files...")
-    for group in [1, 2]:
-        if not group_match_files[group]:
-            print(f"Skipping Group {group} — no match files found.")
-            continue
-
-        # Extract all camera numbers that appear in matches for this group
-        cams_in_group = set()
-        for mf in group_match_files[group]:
-            pair = os.path.basename(mf).replace(f"run_group{group}-", "").replace(".match", "")
-            chans = [int(x.split("ch")[1][:2]) for x in pair.split("__") if "ch" in x]
-            cams_in_group.update(chans)
-
-        cams_in_group = sorted(list(cams_in_group))
-        print(f"Group {group} cameras: {cams_in_group}")
-
-        # Subset image/camera files by those numbers
-        group_images = []
-        group_cameras = []
-        for n, im, cam in sorted(zip(
-            [get_cam_num(f) for f in image_files],
-            image_files,
-            camera_files,
-        ), key=lambda x: x[0]):
-            if n in cams_in_group:
-                group_images.append(im)
-                group_cameras.append(cam)
-
-        if not group_images:
-            print(f"No valid images found for Group {group}")
-            continue
-
-        # --- Run bundle adjustment for this group ---
-        print(f"\n--- GROUP {group} bundle adjustment: ch{cams_in_group[0]:02d}-ch{cams_in_group[-1]:02d} ---")
-
-        args = [
-            "parallel_bundle_adjust",
-            "--threads", str(threads),
-            "--num-iterations", "2000",
-            "--num-passes", "2",
-            "--inline-adjustments",
-            "--force-reuse-match-files",
-            "--heights-from-dem", refdem_file,
-            "--heights-from-dem-uncertainty", "0.01",
-            "--solve-intrinsics",
-            "--intrinsics-to-share", "optical_center,other_intrinsics",
-            "--intrinsics-to-float", "all",
-            "-o", os.path.join(output_folder, f"run_group{group}"),
-        ] + group_images + group_cameras
-
-        log = run_cmd("parallel_bundle_adjust", args)
-        _ = write_log_file(log, os.path.join(output_folder, f"run_group{group}"))
-
-    print("\nCamera refinement complete.")
-    return
-
-
-def update_tsai_intrinsics_to_full_fov(
-    params_file: str = None,
-    ba_cam_folder: str = None,
-    output_cam_folder: str = None
-    ) -> None:
-    """
-    Update .tsai camera files with optimized intrinsics mapped to full field of view.
-
-    Parameters
-    ----------
-    params_file: str
-        path to CSV file containing optimized camera parameters
-    ba_cam_folder: str
-        folder containing the .tsai camera files from bundle adjustment
-    output_cam_folder: str
-        folder where the updated .tsai camera files will be saved
-
-    Returns
-    ----------
-    None
-    """
-    os.makedirs(output_cam_folder, exist_ok=True)
-
-    # Load the camera and distortion parameters file
-    params = pd.read_csv(params_file)
-    params['K'] = params['K'].apply(ast.literal_eval)
-    params['K_full'] = params['K_full'].apply(ast.literal_eval)
-    params['dist'] = params['dist'].apply(ast.literal_eval) 
-
-    # Get list of cameras from the bundle_adjust folder
-    cam_files = sorted(glob(os.path.join(ba_cam_folder, '*.tsai')))
-
-    # Iterate over rows
-    for _, row in tqdm(params.iterrows(), total=len(params), file=sys.stdout):
-        camera = row['camera']
-        if camera < 10:
-            ch = 0 + str(camera)
-        else:
-            ch = str(camera)
-
-        # Find matching .tsai camera file
-        cam_matches = [x for x in cam_files if ch in os.path.basename(x)]
-        if not cam_matches:
-            print(f"No camera found for camera {ch}")
-            continue
-        cam_file = cam_matches[0]
-
-        # Read the optimized camera intrinsics from .tsai
-        with open(cam_file, "r") as f:
-            cam_lines = [l.strip() for l in f.readlines() if l.strip()]
-
-        fu = fv = cu = cv = None
-        for line in cam_lines:
-            if line.startswith("fu"):
-                fu = float(line.split()[-1])
-            elif line.startswith("fv"):
-                fv = float(line.split()[-1])
-            elif line.startswith("cu"):
-                cu = float(line.split()[-1])
-            elif line.startswith("cv"):
-                cv = float(line.split()[-1])
-
-        if None in (fu, fv, cu, cv):
-            print(f"Missing intrinsic values in {cam_file}")
-            continue
-
-        # Construct intrinsic matrices
-        K_opt = np.array([
-            [fu, 0, cu],
-            [0, fv, cv],
-            [0, 0, 1]
-            ])
-        K_crop = row["K"].reshape(3, 3)
-        K_full = row["K_full"].reshape(3, 3)
-
-        # Calculate transform crop -> full
-        H = K_full @ np.linalg.inv(K_crop)
-
-        # Map optimized intrinsics into full-FOV coordinate system
-        K_opt_full = H @ K_opt
-        K_opt_full /= K_opt_full[2, 2]
-
-        fu_full = K_opt_full[0, 0]
-        fv_full = K_opt_full[1, 1]
-        cu_full = K_opt_full[0, 2]
-        cv_full = K_opt_full[1, 2]
-
-        # Update lines
-        updated_lines = []
-        for line in cam_lines:
-            if line.startswith("fu"):
-                updated_lines.append(f"fu = {fu_full}")
-            elif line.startswith("fv"):
-                updated_lines.append(f"fv = {fv_full}")
-            elif line.startswith("cu"):
-                updated_lines.append(f"cu = {cu_full}")
-            elif line.startswith("cv"):
-                updated_lines.append(f"cv = {cv_full}")
-            else:
-                updated_lines.append(line)
-
-        # Write out new camera file
-        cam_out_file = os.path.join(
-            output_cam_folder, os.path.basename(cam_file).replace(".tsai", "_full_fov.tsai")
-        )
-        with open(cam_out_file, "w") as f:
-            f.write("\n".join(updated_lines) + "\n")
-        print('Saved updated camera with full FOV:', cam_out_file)
-
-    return
-
-
-def run_stereo(
-        image_files: list[str] = None,
-        camera_files: list[str] = None,
-        refdem_file: str = None,
-        output_folder: str = None,
-        threads_string: str = 'all'
-    ):
-    """
-    Run stereo processing on pairs of images using Ames Stereo Pipeline's parallel_stereo.
-
-    Parameters
-    ----------
-    image_files: list[str]
-        list of paths to image files
-    camera_files: list[str]
-        list of paths to camera model files corresponding to the images
-    refdem_file: str
-        path to the reference DEM file. Required if input images are mapprojected.
-    output_folder: str
-        folder where the stereo outputs will be saved
-    threads_string: str
-        number of threads to use for parallel_stereo
-
-    Returns
-    ----------
-    None
-    """
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Determine number of threads to use for parallel_stereo
-    threads = determine_threads(threads_string)
-    
-    # Extract numeric camera IDs (assumes pattern like "*ch01*", "*ch12*")
-    def get_cam_num(f):
-        base = os.path.basename(f)
-        try:
-            return int(base.split("ch")[1][:2])
-        except Exception:
-            raise ValueError(f"Could not parse camera number from filename: {base}")
-
-    # Map image -> camera number
-    im_numbers = [get_cam_num(f) for f in image_files]
-    print("Detected camera numbers:", im_numbers)
-
-    # Sort by camera number (in case input order isn’t sorted)
-    sorted_pairs = sorted(zip(im_numbers, image_files, camera_files), key=lambda x: x[0])
-    im_numbers, image_files, camera_files = zip(*sorted_pairs)
-
-    # Define image pairs
-    img1_list, img2_list = image_files[0:-1], image_files[1:]
-    cam1_list, cam2_list = camera_files[0:-1], camera_files[1:]
-
-    npairs = len(img1_list)
-    print(f"Found {npairs} total image pairs for stereo processing.")
-
-    # Iterate over image pairs
-    for i in tqdm(range(len(img1_list)), file=sys.stdout):
-        img1, img2 = img1_list[i], img2_list[i]
-        cam1, cam2 = cam1_list[i], cam2_list[i]
-
-        # Define the output prefix
-        pair_prefix = os.path.join(
-            output_folder,
-            f"{os.path.splitext(os.path.basename(img1))[0]}__{os.path.splitext(os.path.basename(img2))[0]}",
-            "run",
-        )
-
-        # Construct the arguments
-        args = [
-            "--threads-singleprocess", str(threads),
-            "--threads-multiprocess", str(threads),
-            "--nodata-value", "NaN",
-            '--alignment-method', 'none',
-            img1, img2,
-            cam1, cam2,
-            pair_prefix,
-        ]
-        if refdem_file:
-            args += [refdem_file]
-
-        # print(f"Running stereo for image pair: {os.path.basename(img1)} and {os.path.basename(img2)}")
-        log = run_cmd("parallel_stereo", args)
-        # (log already saved to file, no need to save)
-
-    print('Stereo processing complete.')
-
-    return
-
-
-def rasterize_point_clouds(
-        pc_files: list[str] = None, 
-        t_res: float = 0.006,
-        t_crs: str = "EPSG:32619",
-        ):
-    """
-    Rasterize point clouds by converting ECEF height in the point cloud to model space height.
-
-    Parameters
-    ----------
-    pc_files: list[str]
-        list of paths to point cloud files
-    t_res: float
-        target resolution for the rasterized DEMs
-    t_crs: str
-        EPSG code of the target CRS for the rasterized DEMs
-
-    Returns
-    ----------
-    None
-    """
-
-    # Iterate over point clouds
-    for pc_file in tqdm(pc_files, file=sys.stdout):
-        # Define output file
-        pc_out_file = pc_file.replace('-PC.tif', '-DEM.tif')
-        
-        # Load point cloud DEM
-        dem = rxr.open_rasterio(pc_file).isel(band=2)
-        crs = dem.rio.crs
-
-        # Set no data values to NaN
-        dem = xr.where(dem==0, np.nan, dem)
-        dem = dem.rio.write_crs(crs)
-
-        # Resample to desired output resolution
-        dx, dy = dem.rio.resolution()
-        upscale_factor = np.mean([np.abs(t_res / dx), np.abs(t_res / dy)])
-        new_width = int(dem.rio.width * upscale_factor)
-        new_height = int(dem.rio.height * upscale_factor)
-        dem_resampled = dem.rio.reproject(
-            crs,
-            shape=(new_height, new_width),
-        ).rio.write_crs(crs)
-        
-        # Make sure it's in the target CRS
-        if f"EPSG:{crs.to_epsg()}" != t_crs:
-            dem_resampled = dem_resampled.rio.reproject(t_crs)
-
-        # Save new DEM
-        dem_resampled.rio.to_raster(pc_out_file)
-        print("Saved DEM:", pc_out_file)
-
-    print('Rasterization of point clouds complete')
-    return
-
-
-def align_dems(
-        dem_files: list[str] = None, 
-        refdem_file: str = None, 
-        max_displacement: float = 100, 
-        threads_string: str = 'all'
-        ) -> None:
-    """
-    Align DEM files to a reference DEM using Ames Stereo Pipeline's pc_align.
-
-    Parameters
-    ----------
-    dem_files: list[str]
-        list of paths to DEM files to be aligned
-    refdem_file: str
-        path to the reference DEM file
-    max_displacement: float
-        maximum allowed displacement in meters
-    threads_string: str
-        number of threads to use during pc_align
-        
-    Returns
-    ----------
-    None
-    """
-    
-    # Determine number of threads
-    threads = determine_threads(threads_string)
-
-    # Iterate over DEM files
-    for dem_file in tqdm(dem_files, file=sys.stdout):
-        # construct args
-        args = [
-            '--max-displacement', str(max_displacement),
-            '--threads', str(threads),
-            '--save-transformed-source-points',
-            refdem_file, dem_file,
-            '-o', os.path.join(os.path.dirname(dem_file), 'pc_align_run')
-        ]
-        log = run_cmd('pc_align', args)
-        # (log already created by ASP, no need to save)
-
-    print('DEM alignment complete.')
-    return
-    
-def mosaic_dems(
-        dem_files: list[str] = None,
-        output_file: str = None,
-        threads_string: str = 'all'
-    ) -> None:
-    """
-    Mosaic DEM files using Ames Stereo Pipeline's dem_mosaic.
-
-    Parameters
-    ----------
-    dem_files: list[str]
-        list of paths to DEM files to be mosaicked
-    output_file: str
-        path to the output mosaicked DEM file
-    threads_string: str
-        number of threads to use ('all' to use all available cores)
-        
-    Returns
-    ----------
-    None
-    """
-
-    print('Mosaicking DSMs')
-    output_folder = os.path.dirname(output_file)
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Determine number of threads to use
-    threads = determine_threads(threads_string)
-
-    # Run dem_mosaic
-    args = [
-        '--threads', str(threads),
-        '-o', output_file
-    ] + dem_files
-
-    _ = run_cmd('dem_mosaic', args)
-    # (log already written to file by ASP, no need to save)
-
-    print('DEM mosaicking complete.')
     return

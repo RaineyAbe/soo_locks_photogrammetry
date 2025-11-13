@@ -3,15 +3,18 @@
 import os
 import pandas as pd
 import rioxarray as rxr
-from shapely.geometry import shape, Polygon, MultiPolygon
+from shapely.geometry import shape, Polygon, MultiPolygon, LineString
 from shapely import get_coordinates
 from shapely.ops import unary_union
+import shapely
 import geopandas as gpd
 import xarray as xr
 import numpy as np
 import rasterio as rio
 import matplotlib
+import matplotlib.pyplot as plt
 import cv2
+
 
 def calculate_image_footprint(raster_file):
     # create a mask of data coverage
@@ -87,6 +90,133 @@ def calculate_image_overlap(bounds_gdf, buffer=0.01):
     return overlap_gdf
 
 
+def rpy_to_matrix(roll, pitch, yaw):
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(roll), -np.sin(roll)],
+        [0, np.sin(roll), np.cos(roll)]
+    ])
+    Ry = np.array([
+        [np.cos(pitch), 0, np.sin(pitch)],
+        [0, 1, 0],
+        [-np.sin(pitch), 0, np.cos(pitch)]
+    ])
+    Rz = np.array([
+        [np.cos(yaw), -np.sin(yaw), 0],
+        [np.sin(yaw), np.cos(yaw), 0],
+        [0, 0, 1]
+    ])
+    return Rz @ Ry @ Rx
+
+
+def create_new_footprint(
+    camera_xyz,
+    roll_deg=0,
+    pitch_deg=0,
+    yaw_deg=15,
+    fov_h_deg=120,
+    fov_v_deg=65,
+    ground_z=-8,
+    image_width=4512,
+    image_height=2512,
+    trusses=None,
+    model_space=None
+    ):
+    X, Y, Z = camera_xyz
+    roll, pitch, yaw = np.deg2rad([roll_deg, pitch_deg, yaw_deg])
+
+    # --- Camera intrinsics ---
+    fx = image_width / (2 * np.tan(np.deg2rad(fov_h_deg / 2)))
+    fy = image_height / (2 * np.tan(np.deg2rad(fov_v_deg / 2)))
+    cx, cy = image_width / 2, image_height / 2
+    K = np.array([
+        [fx, 0, cx], 
+        [0, fy, cy], 
+        [0, 0, 1]
+        ], dtype=np.float64)
+
+    # --- Camera rotation/translation ---
+    R_cw = rpy_to_matrix(roll, pitch, yaw)
+
+    # --- Project image corners to ground plane ---
+    image_corners = np.array([
+        [0, 0],
+        [image_width - 1, 0],
+        [image_width - 1, image_height - 1],
+        [0, image_height - 1]
+    ], dtype=np.float32)
+
+    world_footprint = []
+    for u, v in image_corners:
+        x = (u - cx) / fx
+        y = (v - cy) / fy
+        ray_cam = np.array([x, y, 1.0])
+        ray_world = R_cw @ ray_cam
+        s = (ground_z - Z) / ray_world[2]
+        intersection = np.array([X, Y, Z]) + s * ray_world
+        world_footprint.append(intersection)
+
+    world_footprint = np.array(world_footprint)
+    footprint_poly = Polygon(world_footprint[:, :2])
+
+    model_space_geom = model_space['geometry'].values[0].buffer(-0.05)
+
+    # Iterate over trusses (if cameras aren't nadir)
+    if (trusses is not None) & (roll!=0):
+        for _,truss_row in trusses.iterrows():
+            footprint_split_half = None
+            extended_line = None
+            truss_coords = np.array(truss_row['geometry'].exterior.coords, dtype=np.float32)
+
+            # get the bottom
+            ibottom = np.argwhere(truss_coords[:,2]==min(truss_coords[:,2])).reshape(1,-1)
+            truss_bottom = np.unique(truss_coords[ibottom], axis=1)[0]
+
+            # extend truss bottom plane from camera to ground height
+            extended_pts = []
+            for p in truss_bottom:
+                direction = p - camera_xyz
+                t = (ground_z - Z) / direction[2]
+                p_ground = camera_xyz + t * direction
+                extended_pts.append(p_ground)
+            extended_pts = np.array(extended_pts)
+
+            # create linestring in the XY plane
+            extended_line = LineString(extended_pts[:,:2])
+
+            # Scale to make sure it crosses the image footprint
+            extended_line = shapely.affinity.scale(extended_line, xfact = 5, yfact = 5)
+
+            # now, use it to split the footprint
+            footprint_split = shapely.ops.split(footprint_poly, extended_line)
+            
+            # continue if the footprint wasn't split (truss line didn't intersect footprint)
+            if len(footprint_split.geoms) < 2:
+                continue
+            
+            # identify the "north" vs. "south" halves of the split
+            footprint_split_centroids_y = [x.centroid.coords.xy[1] for x in footprint_split.geoms]
+            if footprint_split_centroids_y[0] > footprint_split_centroids_y[1]:
+                footprint_split_N = footprint_split.geoms[0]
+                footprint_split_S = footprint_split.geoms[1]
+            else:
+                footprint_split_N = footprint_split.geoms[1]
+                footprint_split_S = footprint_split.geoms[0]
+
+            # select the split half based on viewing angle
+            if roll > 0: # positive viewing angle
+                footprint_split_half = footprint_split_S
+            elif roll < 0: # negative viewing angle
+                footprint_split_half = footprint_split_N
+
+            footprint_poly = footprint_split_half
+
+    # Crop to model space
+    footprint_poly = footprint_poly.intersection(model_space_geom)
+
+    return footprint_poly
+
+
 def get_coords_between_cams(ch1, ch2, cams):
     cam1 = cams.loc[cams['channel']==ch1]
     cam2 = cams.loc[cams['channel']==ch2]
@@ -110,192 +240,6 @@ def calculate_no_coverage(model_space_gdf, bounds_gdf, buffer=0.01):
     no_coverage = model_union.difference(total_coverage)
     
     return no_coverage
-
-
-def create_new_footprint(
-        camera_xyz,
-        roll_deg=0,
-        pitch_deg=0,
-        yaw_deg=-15,
-        fov_h_deg=120,
-        fov_v_deg=65,
-        ground_z=-8,
-        image_width=4512,
-        image_height=2512,
-        trusses_gdf=None,
-        model_space=None
-):
-    # Construct the camera rotation amtrix
-    X, Y, Z = camera_xyz
-    fx = image_width / (2 * np.tan(np.deg2rad(fov_h_deg / 2)))
-    fy = image_height / (2 * np.tan(np.deg2rad(fov_v_deg / 2)))
-    cx, cy = image_width / 2, image_height / 2
-    roll, pitch, yaw = map(np.deg2rad, [roll_deg, pitch_deg, yaw_deg])
-    R = cv2.Rodrigues(np.array([roll, pitch, yaw]))[0]
-
-    # Image corners (pixel coords)
-    image_corners = np.array([
-        [0, 0],                                 # lower left
-        [image_width - 1, 0],                   # lower right
-        [image_width - 1, image_height - 1],    # upper right
-        [0, image_height - 1],                  # upper left
-    ], dtype=np.float32)
-
-    # Project each corner to ground plane
-    world_footprint = []
-    for u, v in image_corners:
-        x = (u - cx) / fx
-        y = (v - cy) / fy
-        ray_cam = np.array([x, y, 1.0])
-        ray_world = R.T @ ray_cam
-        s = (ground_z - Z) / ray_world[2]
-        intersection = np.array([X, Y, Z]) + s * ray_world
-        world_footprint.append(intersection)
-    world_footprint = np.array(world_footprint)
-
-    # Check for truss intersections (YZ plane)
-    if trusses_gdf is not None:
-        # Compute camera forward direction (horizontal)
-        forward_world = R.T @ np.array([0, 0, 1])
-        forward_xy = forward_world[:2]
-        norm_xy = np.linalg.norm(forward_xy)
-        # normalize, avoiding division by zero
-        if norm_xy < 1e-9:
-            forward_xy[:] = np.array([0, 1])
-        else:
-            forward_xy /= norm_xy
-
-        # create YZ polygon that includes camera position 
-        world_footprint_yz = Polygon([ 
-            (Y, Z), # camera position 
-            (min(world_footprint[:,1]), ground_z), # front edge 
-            (max(world_footprint[:,1]), ground_z), # back edge 
-            (Y, Z) # close the polygon 
-            ])
-
-        dy_N, dy_S = 0, 0
-        for _, truss_row in trusses_gdf.iterrows():
-            truss = truss_row.geometry
-            truss_y = [c[1] for c in truss.exterior.coords]
-            truss_z = [c[2] for c in truss.exterior.coords]
-            truss_yz = Polygon(np.column_stack((truss_y, truss_z)))
-
-            if not world_footprint_yz.intersects(truss_yz):
-                continue
-
-            truss_bottom = np.min(truss_z)
-            if Y < np.min(truss_y):  # looking toward +Y
-                theta = np.arctan((Z - truss_bottom) / (np.min(truss_y) - Y))
-                dy = -(Z - truss_bottom) / np.tan(theta)
-                dy_N = min(dy_N, dy)
-            elif Y > np.max(truss_y):  # looking toward -Y
-                theta = np.arctan((Z - truss_bottom) / (Y - np.max(truss_y)))
-                dy = (Z - truss_bottom) / np.tan(theta)
-                dy_S = max(dy_S, dy)
-        
-        # Add the y adjustments
-        # sort by northness
-        sorted_indices = world_footprint[:, 1].argsort()
-        world_footprint = world_footprint[sorted_indices]
-        # add dy_S to the southernmost
-        # world_footprint[-2:, 1] += dy_S
-        # subtract dy_N from the northernmost
-        # world_footprint[0:2, 1] -= dy_N
-        print(dy_S, dy_N)
-
-        # undo the sort to avoid invalid geometries
-        unsorted_indices = np.argsort(sorted_indices)
-        world_footprint = world_footprint[unsorted_indices]
-
-    # Construct polygon
-    footprint_poly = Polygon(world_footprint[:, :2])
-
-    if model_space is not None:
-        footprint_poly = footprint_poly.intersection(model_space.geometry.values[0])
-
-    return footprint_poly
-
-
-def calculate_specs_from_new_coords(
-        new_coords: np.array = None, 
-        new_rolls: np.array = None, 
-        new_pitches: np.array = None, 
-        new_yaws: np.array = None, 
-        cams: pd.DataFrame = None, 
-        bounds: gpd.GeoDataFrame = None, 
-        fov_h: float = 120, 
-        fov_v: float = 65,
-        trusses_gdf: gpd.GeoDataFrame = None,
-        model_space: gpd.GeoDataFrame = None, 
-        ):
-    
-    # --- Create new cameras dataframe ---
-    new_channels = np.arange(len(new_coords)) + 1 + len(cams)
-    new_channels_string = [f"ch{x}" if x >=10 else f"ch0{x}" for x in new_channels]
-
-    cams_new = pd.DataFrame({
-        'img_name': ['None']*len(new_coords),
-        'X': new_coords[:,0],
-        'Y': new_coords[:,1],
-        'Z': new_coords[:,2],
-        'X_std': [0.1]*len(new_coords),
-        'Y_std': [0.1]*len(new_coords),
-        'Z_std': [0.1]*len(new_coords),
-        'channel': new_channels_string
-    })
-    
-    # Combine original + new cameras
-    cams_new_full = pd.concat([cams, cams_new]).reset_index(drop=True)
-    n_total = len(cams_new_full)
-    n_existing = len(cams)
-    n_new = len(cams_new)
-    
-    # --- Ensure rotation arrays are correctly sized ---
-    if new_rolls is None:
-        new_rolls = np.zeros(n_new)
-    if new_pitches is None:
-        new_pitches = np.zeros(n_new)
-    if new_yaws is None:
-        new_yaws = -15*np.ones(n_new)
-        
-    # Full arrays: existing cameras assumed nadir (0 roll/pitch) + yaw=-15 deg
-    rolls_full = np.concatenate([np.zeros(n_existing), new_rolls])
-    pitches_full = np.concatenate([np.zeros(n_existing), new_pitches])
-    yaws_full = np.concatenate([-15*np.ones(n_existing), new_yaws])
-    
-    # --- Calculate footprints for all cameras ---
-    bounds_new_list = []
-    for i in range(n_total):
-        cam_pos = cams_new_full[['X','Y','Z']].iloc[i].values
-        roll, pitch, yaw = rolls_full[i], pitches_full[i], yaws_full[i]
-        footprint = create_new_footprint(
-            camera_xyz=cam_pos,
-            model_space=model_space,
-            roll_deg=roll,
-            pitch_deg=pitch,
-            yaw_deg=yaw,
-            fov_h_deg=fov_h,
-            fov_v_deg=fov_v,
-            trusses_gdf=trusses_gdf
-        )
-        bounds_new_list.append(gpd.GeoDataFrame({
-            'geometry': [footprint],
-            'channel': [cams_new_full['channel'].iloc[i]]
-        }))
-
-    bounds_new_gdf = pd.concat(bounds_new_list[n_existing:]).reset_index(drop=True)
-    bounds_new_gdf['geometry'] = bounds_new_gdf['geometry']
-    bounds_new_full_gdf = pd.concat([bounds, bounds_new_gdf]).reset_index(drop=True)
-    bounds_new_full_gdf['geometry'] = bounds_new_full_gdf['geometry']
-    
-    # recalculate image overlap 
-    overlap_new_gdf = calculate_image_overlap(bounds_new_full_gdf) 
-
-    # identify model space with no coverage 
-    no_coverage_new_full = calculate_no_coverage(model_space, bounds_new_full_gdf) 
-    print('No coverage area = ', np.round(no_coverage_new_full.area,1), 'm^2') 
-    
-    return cams_new, cams_new_full, bounds_new_gdf, bounds_new_full_gdf, overlap_new_gdf, no_coverage_new_full
 
 
 def create_distortion_map(
@@ -397,7 +341,7 @@ def create_distortion_map(
 
     
 def plot_model_coverage(axis, model_space, bounds, overlap, cam_positions, no_coverage,
-                        bounds_color='#7570b3', overlap_color='#7570b3', missing_color='#d95f02', new_cam_color='#e7298a'):
+                        bounds_color='#8da0cb', overlap_color='#8da0cb', missing_color='#fc8d62', new_cam_color="#1b9e77"):
     # model space
     model_space.plot(ax=axis, edgecolor='k', facecolor='None', linewidth=2)
     # image footprints
@@ -412,7 +356,7 @@ def plot_model_coverage(axis, model_space, bounds, overlap, cam_positions, no_co
     axis.plot(cam_positions_current['X'].values, cam_positions_current['Y'].values, '*k', markersize=8, label='Cameras')
     cam_positions_new = cam_positions.iloc[16:]
     axis.plot(cam_positions_new['X'].values, cam_positions_new['Y'].values, '*', 
-              markerfacecolor='None', markeredgecolor=new_cam_color, linewidth=1.5, markersize=12, label='NEW cameras')
+              markerfacecolor='None', markeredgecolor=new_cam_color, markeredgewidth=2, markersize=12, label='NEW cameras')
     # dummy points for legend
     xmin, xmax = axis.get_xlim()
     ymin, ymax = axis.get_ylim()
@@ -428,7 +372,7 @@ def plot_model_coverage(axis, model_space, bounds, overlap, cam_positions, no_co
 
 
 def plot_vertical_view(axis, trusses_gdf, cams = None, cams_new = None, bounds = None, bounds_new = None,
-                       bounds_color='#7570b3', new_cam_color='#e7298a'):
+                       bounds_color='#8da0cb', new_cam_color='#1b9e77'):
     # trusses
     for _,row in trusses_gdf.iterrows():
         truss_y = np.array([coord[1] for coord in row['geometry'].exterior.coords])
@@ -466,7 +410,7 @@ def plot_vertical_view(axis, trusses_gdf, cams = None, cams_new = None, bounds =
     # new camera positions
     if cams_new is not None:
         for i,row in cams_new.iterrows():
-            axis.plot(row['Y'], row['Z'], '*', markerfacecolor='None', markeredgecolor=new_cam_color, linewidth=1.5, markersize=10)
+            axis.plot(row['Y'], row['Z'], '*', markerfacecolor='None', markeredgecolor=new_cam_color, markeredgewidth=2, markersize=10)
     
     # ceiling
     axis.plot([0,70], [-3,-3], '-k')
@@ -482,25 +426,20 @@ def plot_vertical_view(axis, trusses_gdf, cams = None, cams_new = None, bounds =
     return
 
 
-def save_specs_los(bounds_new, cams_new, cams, out_file, fov_h=120, fov_v=65):
+def save_specs_los(cameras_xyz, rolls, pitches, yaws, out_file, fov_h=120, fov_v=65):
     # Estimate FOV
-    rotation = -13
-    yaw = 360 + rotation
-    cam_height = float(cams['Z'].mean()) + 8
     specs_list = []
-    for i,_ in bounds_new.iterrows():
-        cam = cams_new.iloc[i]
+    for i in range(len(cameras_xyz)):
         # compile in dataframe
         df = pd.DataFrame({
-            'new_cam_number': i+1,
-            'X': cam['X'],
-            'Y': cam['Y'],
-            'Z': cam_height,
+            'X': cameras_xyz[i,0],
+            'Y': cameras_xyz[i,1],
+            'Z': cameras_xyz[i,2],
             'FOV_vertical': fov_v,
             'FOV_horizontal': fov_h,
-            'roll': 0,
-            'pitch': 0,
-            'yaw': yaw
+            'roll': rolls[i],
+            'pitch': pitches[i],
+            'yaw': yaws[i]
         }, index=[i])
         specs_list += [df]
 
@@ -512,3 +451,162 @@ def save_specs_los(bounds_new, cams_new, cams, out_file, fov_h=120, fov_v=65):
     print("New camera specs saved to file:", out_file)
     return
 
+
+def calculate_new_coverage(
+        new_coords: np.array = None, 
+        new_rolls: np.array = None, 
+        new_pitches: np.array = None, 
+        new_yaws: np.array = None, 
+        cams: pd.DataFrame = None, 
+        bounds: gpd.GeoDataFrame = None, 
+        fov_h: float = 120, 
+        fov_v: float = 65,
+        trusses: gpd.GeoDataFrame = None,
+        model_space: gpd.GeoDataFrame = None, 
+        out_folder: str = None,
+        label: str = None
+        ):
+    
+    # --- Create new cameras dataframe ---
+    new_channels = np.arange(len(new_coords)) + 1 + len(cams)
+    new_channels_string = [f"ch{x}" if x >=10 else f"ch0{x}" for x in new_channels]
+
+    cams_new = pd.DataFrame({
+        'img_name': ['None']*len(new_coords),
+        'X': new_coords[:,0],
+        'Y': new_coords[:,1],
+        'Z': new_coords[:,2],
+        'X_std': [0.1]*len(new_coords),
+        'Y_std': [0.1]*len(new_coords),
+        'Z_std': [0.1]*len(new_coords),
+        'channel': new_channels_string
+    })
+    
+    # Combine original + new cameras
+    cams_new_full = pd.concat([cams, cams_new]).reset_index(drop=True)
+    n_total = len(cams_new_full)
+    n_existing = len(cams)
+    n_new = len(cams_new)
+    
+    # --- Ensure rotation arrays are correctly sized ---
+    if new_rolls is None:
+        new_rolls = np.zeros(n_new)
+        print('No new rolls provided, setting all to 0.')
+    if new_pitches is None:
+        new_pitches = np.zeros(n_new)
+        print('No new pitches provided, setting all to 0.')
+    if new_yaws is None:
+        new_yaws = 15*np.ones(n_new)
+        print('No new yaws provided, setting all to 15.')
+        
+    # Full arrays: existing cameras assumed nadir (0 roll/pitch) + yaw=15 deg
+    rolls_full = np.concatenate([np.zeros(n_existing), new_rolls])
+    pitches_full = np.concatenate([np.zeros(n_existing), new_pitches])
+    yaws_full = np.concatenate([15*np.ones(n_existing), new_yaws])
+    
+    # --- Calculate footprints for all cameras ---
+    bounds_new_list = []
+    for i in range(n_total):
+        cam_pos = cams_new_full[['X','Y','Z']].iloc[i].values
+        roll, pitch, yaw = rolls_full[i], pitches_full[i], yaws_full[i]
+        footprint = create_new_footprint(
+            camera_xyz=cam_pos,
+            model_space=model_space,
+            roll_deg=roll,
+            pitch_deg=pitch,
+            yaw_deg=yaw,
+            fov_h_deg=fov_h,
+            fov_v_deg=fov_v,
+            trusses=trusses
+        )
+        bounds_new_list.append(gpd.GeoDataFrame({
+            'geometry': [footprint],
+            'channel': [cams_new_full['channel'].iloc[i]]
+        }))
+
+    bounds_new = pd.concat(bounds_new_list[n_existing:]).reset_index(drop=True)
+    bounds_new['geometry'] = bounds_new['geometry']
+    bounds_new_full = pd.concat([bounds, bounds_new]).reset_index(drop=True)
+    bounds_new_full['geometry'] = bounds_new_full['geometry']
+    
+    # --- Recalculate image overlap ---
+    overlap_new = calculate_image_overlap(bounds_new_full) 
+
+    # --- Identify model space with no coverage ---
+    no_coverage_new_full = calculate_no_coverage(model_space, bounds_new_full) 
+    print('No coverage area = ', np.round(no_coverage_new_full.area,1), 'm^2') 
+
+    # --- Calculate relative distortion ---
+    distortion_map = create_distortion_map(
+        cams_gdf = cams_new_full,
+        footprints_gdf = bounds_new_full,
+        yaw_series = 15 * np.ones(len(cams_new_full)),
+        pitch_series = np.zeros(len(cams_new_full)),
+        roll_series = np.zeros(len(cams_new_full)),
+        fov_h_deg = fov_h,
+        fov_v_deg = fov_v,
+        model_space = model_space
+    )
+    # add the minimum value
+    distortion_map += 5.297444280721465
+
+    # --- Plot results ---
+    gs = matplotlib.gridspec.GridSpec(2,2, height_ratios=[4,1])
+    fig = plt.figure(figsize=(10,14))
+    ax = [
+        fig.add_subplot(gs[0,0]),
+        fig.add_subplot(gs[0,1]),
+        fig.add_subplot(gs[1,:])
+        ]
+    # plot model coverage
+    plot_model_coverage(
+        axis = ax[0],
+        model_space = model_space,
+        bounds = bounds_new_full,
+        overlap = overlap_new,
+        cam_positions = cams_new_full,
+        no_coverage = no_coverage_new_full
+        )
+    ax[0].legend(loc='lower left')
+    # plot relative distortion
+    distortion_map.plot(ax=ax[1], cmap='Reds', vmin=0, vmax=1.5, cbar_kwargs={'shrink': 0.5})
+    # print distortion stats
+    ax[1].text(-28, 75, f"Mean = {np.round(distortion_map.mean().data, 2)}")
+    ax[1].text(-28, 73, f"Median = {np.round(distortion_map.median().data, 2)}")
+    ax[1].set_xlim(ax[0].get_xlim())
+    ax[1].set_ylim(ax[0].get_ylim())
+    ax[1].set_xlabel('X [meters]')
+    ax[1].set_ylabel('')
+    ax[1].set_title('')
+    # plot vertical view
+    plot_vertical_view(
+        axis = ax[2], 
+        trusses_gdf = trusses,
+        cams = cams,
+        cams_new = cams_new,
+        bounds = bounds,
+        bounds_new = bounds_new
+        )
+
+    fig.suptitle(label)
+    fig.tight_layout()
+    plt.show()
+
+    # --- Save results ---
+    label_file = label.replace(' ','_').lower()
+    # figure
+    fig_file = os.path.join(out_folder, f"{label_file}.png")
+    fig.savefig(fig_file, dpi=300, bbox_inches='tight')
+    print('Figure saved to file:', fig_file)
+
+    # Save new specs
+    out_file = os.path.join(out_folder, f"{label_file}_specs.csv")
+    save_specs_los(
+        cameras_xyz = new_coords,
+        rolls = new_rolls,
+        pitches = new_pitches,
+        yaws = new_yaws,
+        out_file = out_file
+    )
+    
+    return

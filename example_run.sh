@@ -9,8 +9,5 @@ python generate_orthoimage.py \
 -video_folder "${BASE_PATH}/20251001_imagery/video" \
 -target_datetime "20251001171000" \
 -inputs_folder "${BASE_PATH}/inputs" \
--output_folder "${BASE_PATH}/20251001_imagery" \
--refine_cameras 0 \
--output_res 0.003 \
--threads "all" \
--generate_dsm 1
+-output_folder "${BASE_PATH}/outputs" \
+-refine_cameras 1
