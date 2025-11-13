@@ -34,13 +34,13 @@ import ortho_utils
 def getparser():
     parser = argparse.ArgumentParser(description=
                                      'Wrapper script to generate orthoimage from video frames or images for the Soo Locks project. '
-                                     'NOTE: Specify video_folder OR image_folder. If video_folder specified, frames will be pulled at the target_datetime.')
+                                     'NOTE: Specify video_folder OR image_folder as inputs. If video_folder specified, frames will be pulled at the target_datetime.')
     parser.add_argument('-video_folder', default=None, type=str, help='Path to folder containing video files (only video OR image folder needed)')
     parser.add_argument('-image_folder', default=None, type=str, help='Path to folder containing image files (only video OR image folder needed)')
     parser.add_argument('-target_datetime', default=None, type=str, help='Datetime at which to pull video frames')
     parser.add_argument('-inputs_folder', default=None, type=str, help='Path to folder containing standard input files')
     parser.add_argument('-output_folder', default=None, type=str, help='Path to folder where all outputs will be saved')
-    parser.add_argument('-refine_cameras', default=1, type=int, choices=[0,1], help='Whether to re-calibrate cameras. Suggested if cameras have moved slightly since initial lidar scan.')
+    parser.add_argument('-refine_cameras', default=1, type=int, choices=[0,1], help='Whether to re-calibrate cameras. Recommended if cameras have moved slightly since initial lidar scan.')
     return parser
 
 

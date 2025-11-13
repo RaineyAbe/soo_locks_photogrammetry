@@ -275,7 +275,36 @@ class GCPSelector:
         return gcp2
 
 
-def solve_new_pose(gcp_df, K, D, rvec1, tvec1):
+def solve_new_pose(
+        gcp_df: gpd.GeoDataFrame = None, 
+        K: np.array = None, 
+        D: np.array = None, 
+        rvec1: np.array = None, 
+        tvec1: np.array = None
+        ) -> tuple[np.array, np.array]:
+    """
+    Solve for a new camera pose given updated GCP locations.
+
+    Parameters
+    ----------
+    gcp_df : gpd.GeoDataFrame
+        GeoDataFrame containing GCPs with columns 'X', 'Y', 'Z', 'col_sample', 'row_sample'
+    K : np.array
+        Camera intrinsic matrix
+    D : np.array
+        Camera distortion coefficients
+    rvec1 : np.array
+        Initial rotation vector
+    tvec1 : np.array
+        Initial translation vector
+
+    Returns
+    ----------
+    rvec2 : np.array
+        Refined rotation vector
+    tvec2 : np.array
+        Refined translation vector
+    """
     # Prepare GCPs and image points
     obj_pts = gcp_df[['X', 'Y', 'Z']].values.astype(np.float32)
     img_pts = gcp_df[['col_sample', 'row_sample']].values.astype(np.float32)
@@ -324,7 +353,34 @@ def solve_new_pose(gcp_df, K, D, rvec1, tvec1):
     return rvec2, tvec2
 
 
-def refine_camera_poses(image_files, init_image_files, init_cams_file, init_gcp_file, out_folder):
+def refine_camera_poses(
+        image_files: list[str] = None, 
+        init_image_files: list[str] = None, 
+        init_cams_file: str = None, 
+        init_gcp_file: str = None, 
+        out_folder: str = None
+        ) -> str:
+    """
+    Refine camera poses for a set of images using user-selected GCPs.
+
+    Parameters
+    ----------
+    image_files : list[str]
+        List of paths to images to refine
+    init_image_files : list[str]
+        List of paths to initial images corresponding to image_files
+    init_cams_file : str
+        Path to CSV file containing initial camera parameters
+    init_gcp_file : str
+        Path to GPKG file containing initial GCPs
+    out_folder : str
+        Folder to save refined camera parameters
+
+    Returns
+    ----------
+    new_cams_file : str
+        Path to CSV file containing refined camera parameters
+    """
 
     os.makedirs(out_folder, exist_ok=True)
 
@@ -409,7 +465,34 @@ def refine_camera_poses(image_files, init_image_files, init_cams_file, init_gcp_
     return new_cams_file
 
 
-def undistort_image(img, K, D, K_full, mask_nodata=True):
+def undistort_image(
+        img: np.array = None, 
+        K: np.array = None, 
+        D: np.array = None, 
+        K_full: np.array = None, 
+        mask_nodata: bool = True
+        ) -> np.array:
+    """
+    Undistort an image using fisheye model with full FOV intrinsics.
+
+    Parameters
+    ----------
+    img : np.array
+        Input distorted image
+    K : np.array
+        Camera intrinsic matrix
+    D : np.array
+        Camera distortion coefficients
+    K_full : np.array
+        Full FOV camera intrinsic matrix
+    mask_nodata : bool
+        Whether to mask invalid pixels as NaN
+
+    Returns
+    ----------
+    img_undistorted : np.array
+        Undistorted image
+    """
     # Undistort with full FOV
     h,w = img.shape
     map1, map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K_full, (w,h), cv2.CV_32FC1)
@@ -426,7 +509,43 @@ def undistort_image(img, K, D, K_full, mask_nodata=True):
     return img_undistorted
 
 
-def orthorectify(image_file, dem_file, K, D, K_full, rvec, tvec, out_file=None):
+def orthorectify(
+        image_file: str = None, 
+        dem_file: str = None, 
+        K: np.array = None, 
+        D: np.array = None, 
+        K_full: np.array = None, 
+        rvec: np.array = None, 
+        tvec: np.array = None, 
+        out_file: str = None
+        ) -> xr.DataArray:
+    """
+    Orthorectify an image using the provided DEM and camera parameters.
+
+    Parameters
+    ----------
+    image_file : str
+        Path to the input image file
+    dem_file : str
+        Path to the DEM file
+    K : np.array
+        Camera intrinsic matrix
+    D : np.array
+        Camera distortion coefficients
+    K_full : np.array
+        Full FOV camera intrinsic matrix
+    rvec : np.array
+        Rotation vector
+    tvec : np.array
+        Translation vector
+    out_file : str
+        Path to save the orthorectified image
+
+    Returns
+    ----------
+    ortho_xr : xr.DataArray
+        Orthorectified image as an xarray DataArray
+    """
     # Undistort the image
     image = rxr.open_rasterio(image_file).isel(band=0).data
     image_undistorted = undistort_image(image, K, D, K_full)
@@ -617,4 +736,5 @@ def mosaic_orthoimages(
     print("Saving mosaic...")
     mosaic.rio.to_raster(mosaic_file, compute=True)
     print("Saved orthomosaic:", mosaic_file)
+    
     return
