@@ -23,7 +23,7 @@ def calculate_image_footprint(raster_file):
     if 'DSM' in raster_file:
         raster = xr.where(raster!=-9999, raster, np.nan)
     else:
-        raster = xr.where(raster > 0, raster, np.nan)
+        raster = xr.where(raster!=9999, raster, np.nan)
     mask = raster.notnull()
 
     # vectorize the mask
