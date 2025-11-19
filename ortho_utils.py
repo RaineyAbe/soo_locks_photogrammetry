@@ -18,6 +18,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from ast import literal_eval
 import json
+from tqdm import tqdm
+import functools
 # Ignore warnings (rasterio throws a warning whenever an image is not georeferenced. Annoying in this case.)
 import warnings
 warnings.filterwarnings('ignore')
@@ -231,7 +233,7 @@ class GCPSelector:
         self.ax2.imshow(crop2, cmap='gray', extent=[x1, x2, y2, y1])
         self.ax2.set_title("Click New Location")
 
-        self.fig.suptitle(self.img2_file)
+        self.fig.suptitle(os.path.basename(self.img2_file))
 
         for ax in [self.ax1, self.ax2]:
             ax.set_xlim(u - half, u + half)
@@ -385,13 +387,14 @@ def refine_camera_poses(
     os.makedirs(out_folder, exist_ok=True)
 
     # Load initial GCPs
-    gcp = gpd.read_file(init_gcp_file, layer='gcp_merged_stable')
+    gcp = gpd.read_file(init_gcp_file, layer='gcp_merged')
     gcp = gcp.dropna().reset_index(drop=True)
-    gcp['channel'] = [f"ch0{ch}" if ch < 10 else f"ch{ch}" for ch in gcp['channel']]
+    gcp = gcp.loc[gcp['Z'] < 0].reset_index(drop=True)
+    # gcp['channel'] = [f"ch0{ch}" if ch < 10 else f"ch{ch}" for ch in gcp['channel']]
 
     # Load initial camera specs
     init_cams = pd.read_csv(init_cams_file)
-    for k in ['K', 'D', 'K_full', 'rvec', 'tvec']:
+    for k in ['K', 'dist', 'K_full', 'rvec', 'tvec']:
         init_cams[k] = init_cams[k].apply(literal_eval)
         
     # Iterate over images
@@ -412,7 +415,7 @@ def refine_camera_poses(
         # Get camera intrinsics
         init_cam = init_cams.loc[init_cams['channel']==ch]
         K = np.array(init_cam['K'].values[0])
-        D = np.array(init_cam['D'].values[0])
+        dist = np.array(init_cam['dist'].values[0])
         K_full = np.array(init_cam['K_full'].values[0])
         rvec1 = np.array(init_cam['rvec'].values[0])
         tvec1 = np.array(init_cam['tvec'].values[0])
@@ -433,14 +436,14 @@ def refine_camera_poses(
 
         # Refine camera pose
         rvec2, tvec2 = solve_new_pose(
-            new_gcp, K, D, rvec1, tvec1
+            new_gcp, K, dist, rvec1, tvec1
         )
 
         # Save new camera specs
         new_cam = pd.DataFrame({
             'channel': [ch],
             'K': [json.dumps(K.tolist())],
-            'D': [json.dumps(D.tolist())],
+            'dist': [json.dumps(dist.tolist())],
             'K_full': [json.dumps(K_full.tolist())],
             'rvec': [json.dumps(rvec2.tolist())],
             'tvec': [json.dumps(tvec2.tolist())]
@@ -510,17 +513,21 @@ def undistort_image(
 
 
 def orthorectify(
-        image_file: str = None, 
-        dem_file: str = None, 
-        K: np.array = None, 
-        D: np.array = None, 
-        K_full: np.array = None, 
-        rvec: np.array = None, 
-        tvec: np.array = None, 
-        out_file: str = None
-        ) -> xr.DataArray:
+        image_file: str = None,
+        dem_file: str = None,
+        K: np.ndarray = None,
+        D: np.ndarray = None,
+        rvec: np.ndarray = None,
+        tvec: np.ndarray = None,
+        target_res: float = 0.002,
+        max_elevation_above_camera: float = 0.0,
+        fov_deg: float = 120.0,
+        buffer_size: float = 15.0,
+        out_folder: str = None,
+        target_datetime: str = None
+    ) -> xr.DataArray:
     """
-    Orthorectify an image using the provided DEM and camera parameters.
+    Generate an orthorectified image from a single camera image and DEM.
 
     Parameters
     ----------
@@ -528,164 +535,211 @@ def orthorectify(
         Path to the input image file
     dem_file : str
         Path to the DEM file
-    K : np.array
+    K : np.ndarray
         Camera intrinsic matrix
-    D : np.array
+    D : np.ndarray
         Camera distortion coefficients
-    K_full : np.array
-        Full FOV camera intrinsic matrix
-    rvec : np.array
-        Rotation vector
-    tvec : np.array
-        Translation vector
-    out_file : str
-        Path to save the orthorectified image
+    rvec : np.ndarray
+        Camera rotation vector
+    tvec : np.ndarray
+        Camera translation vector
+    target_res : float
+        Target orthorectified pixel resolution (in DEM units)
+    max_elevation_above_camera : float
+        Maximum elevation above camera to consider (in DEM units)
+    fov_deg : float
+        Maximum camera field of view to kee p in degrees
+    buffer_size : float
+        Buffer size around camera position to clip DEM (in DEM units)
+    out_folder : str
+        Folder to save the orthorectified image
 
     Returns
     ----------
     ortho_xr : xr.DataArray
         Orthorectified image as an xarray DataArray
     """
-    # Undistort the image
-    image = rxr.open_rasterio(image_file).isel(band=0).data
-    image_undistorted = undistort_image(image, K, D, K_full)
 
-    # Build coordinate grid from DEM
+    # --- Load image ---
+    img_ds = rio.open(image_file)
+    img = img_ds.read().astype(np.float32)
+    if img.ndim == 2:
+        img = img[np.newaxis, :, :]
+    bands, _, _ = img.shape
+
+    # --- Load DEM ---
     dem = rxr.open_rasterio(dem_file).squeeze()
     crs = dem.rio.crs
-    dem = xr.where(dem==-9999, np.nan, dem)
-    dem_z = dem.data.astype(np.float32)
-    X, Y = np.meshgrid(dem.x.data, dem.y.data)
-    h_img, w_img = image_undistorted.shape[:2]
-    ortho = np.full_like(dem_z, np.nan, dtype=np.float32)
+    dem = xr.where(dem == -9999, np.nan, dem)
 
-    # Calculate rotation matrix 
-    R, _ = cv2.Rodrigues(rvec)
+    # --- Camera rotation matrix and position ---
+    R = cv2.Rodrigues(rvec)[0]
+    cam_pos = (-R.T @ tvec).flatten()
 
-    # Flatten world points
-    world_pts = np.stack([X.ravel(), Y.ravel(), dem_z.ravel()], axis=1)
+    # --- Clip DEM around camera ---
+    # OpenCV limits the number of rows and columns during remap (max=32627)
+    x_cam, y_cam = cam_pos[0], cam_pos[1]
+    dem_clipped = dem.sel(
+        x=slice(x_cam - buffer_size, x_cam + buffer_size),
+        y=slice(y_cam + buffer_size, y_cam - buffer_size)
+    )
 
-    # Transform world→camera
+    if dem_clipped.size == 0:
+        raise ValueError("Clipped DEM area is empty — camera footprint does not intersect DEM.")
+
+    # --- Create dense ortho grid at target resolution ---
+    x_min, x_max = float(dem_clipped.x.min()), float(dem_clipped.x.max())
+    y_min, y_max = float(dem_clipped.y.min()), float(dem_clipped.y.max())
+    Nx = int(np.ceil((x_max - x_min) / target_res)) + 1
+    Ny = int(np.ceil((y_max - y_min) / target_res)) + 1
+
+    X_grid = np.linspace(x_min, x_max, Nx, dtype=np.float32)
+    Y_grid = np.linspace(y_min, y_max, Ny, dtype=np.float32)
+    XX, YY = np.meshgrid(X_grid, Y_grid)
+
+    # Interpolate DEM onto ortho grid
+    dem_grid = dem_clipped.interp(x=X_grid, y=Y_grid, method="nearest").values.astype(np.float32)
+    ZZ = dem_grid
+
+    # --- Flatten grid and transform to camera coordinates ---
+    world_pts = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], axis=1)
     cam_pts = (R @ world_pts.T + tvec).T
 
-    # Prevent divide-by-zero (points behind camera)
-    valid = cam_pts[:, 2] > 0
+    # --- Mask points behind camera or above max elevation ---
+    in_front = cam_pts[:,2] > 0
+    below_max = world_pts[:,2] <= cam_pos[2] + max_elevation_above_camera
+    half_fov_rad = np.radians(fov_deg / 2)
+    inside_fov = np.sqrt(cam_pts[:,0]**2 + cam_pts[:,1]**2) / cam_pts[:,2] <= np.tan(half_fov_rad)
+    valid = in_front & below_max & inside_fov
 
-    # Project onto image plane
-    uv = (K_full @ (cam_pts[valid].T / cam_pts[valid, 2])).T  # (N_valid,3)
-    u = uv[:, 0]
-    v = uv[:, 1]
+    cam_pts = cam_pts[valid]
+    world_pts = world_pts[valid]
 
-    # Fill map arrays
-    map_x = np.full_like(dem_z, np.nan, dtype=np.float32)
-    map_y = np.full_like(dem_z, np.nan, dtype=np.float32)
-    map_x.ravel()[valid] = u
-    map_y.ravel()[valid] = v
-
-    # Sample from the undistorted image
-    safe_map_x = map_x.copy()
-    safe_map_y = map_y.copy()
-    safe_map_x[np.isnan(safe_map_x)] = -1
-    safe_map_y[np.isnan(safe_map_y)] = -1
-
-    sampled = cv2.remap(
-        image_undistorted.astype(np.float32),
-        safe_map_x, safe_map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=np.nan
+    # --- Project points to image coordinates ---
+    img_pts, _ = cv2.fisheye.projectPoints(
+        cam_pts.reshape(-1,1,3),
+        rvec=np.zeros((3,1)),
+        tvec=np.zeros((3,1)),
+        K=K,
+        D=D
     )
+    u = img_pts[:,0,0]
+    v = img_pts[:,0,1]
 
-    # Mask invalid or out-of-bounds regions
-    in_bounds = (
-        (map_x >= 0) & (map_x < w_img) &
-        (map_y >= 0) & (map_y < h_img)
-    )
-    ortho[in_bounds] = sampled[in_bounds]
+    # --- Build dense map for remap ---
+    map_x = np.full(XX.shape, np.nan, dtype=np.float32)
+    map_y = np.full(XX.shape, np.nan, dtype=np.float32)
 
-    # Return as xarray
+    # Map valid world points back to grid indices
+    ix = np.round((world_pts[:,0] - x_min) / target_res).astype(int)
+    iy = np.round((world_pts[:,1] - y_min) / target_res).astype(int)
+    map_x[iy, ix] = u
+    map_y[iy, ix] = v
+
+    # --- Remap image ---
+    ortho = np.zeros((bands, Ny, Nx), dtype=np.float32)
+    for b in range(bands):
+        ortho[b] = cv2.remap(
+            img[b],
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=np.nan
+        )
+        ortho[b][np.isnan(map_x)] = np.nan
+        ortho[b][np.isnan(map_y)] = np.nan
+
+    # --- Wrap as xarray ---
     ortho_xr = xr.DataArray(
         ortho,
-        dims=('y', 'x'),
-        coords={'x': dem.x.data, 'y': dem.y.data}
+        dims=("band", "y", "x"),
+        coords={"x": X_grid, "y": Y_grid}
     )
+    ortho_xr = ortho_xr.dropna(how='all', dim='x').dropna(how='all', dim='y')
+    ortho_xr = ortho_xr.rio.write_crs(crs, inplace=False)
 
-    # Remove totally empty rows and columns
-    ortho_xr = ortho_xr.dropna(dim='x', how='all').dropna(dim='y', how='all')
+    # --- Save to TIFF ---
+    if out_folder is not None:
+        # Define output file name
+        os.makedirs(out_folder, exist_ok=True)
+        ch = 'ch' + os.path.basename(image_file).split('ch')[1][0:2]
+        fname = os.path.join(out_folder, f"{ch}_{target_datetime}_orthoimage.tiff")
 
-    # Save to file
-    if out_file:
-        # convert datatype to int
-        nodata_val = 9999
-        ortho_xr = xr.where(np.isnan(ortho_xr), nodata_val, ortho_xr)
+        # Convert to int datatype
+        ortho_xr = xr.where(np.isnan(ortho_xr), 9999, ortho_xr)
         ortho_xr = ortho_xr.astype(np.uint16)
-        # assign CRS and nodata
-        ortho_xr = ortho_xr.rio.write_nodata(nodata_val)
+
+        # Set properties
         ortho_xr = ortho_xr.rio.write_crs(crs)
-        # ensure orientation matches DEM (north-up)
-        if dem.rio.resolution()[1] < 0:
-            ortho_xr = ortho_xr.sortby('y', ascending=False)
-        # save with integer compression
-        ortho_xr.rio.to_raster(
-            out_file,
-            dtype='uint16'
-        )
-        print(f"Orthorectified image saved to:\n{out_file}")
+        ortho_xr = ortho_xr.rio.write_nodata(9999)
+
+        # Save
+        ortho_xr.rio.to_raster(os.path.join(out_folder, fname))
+        print(f'Orthoimage saved: {fname}')
 
     return ortho_xr
 
 
 def mosaic_orthoimages(
-    image_files: list[str] = None, 
-    closest_cam_map_file: str = None, 
+    image_files: list[str] = None,
+    closest_cam_map_file: str = None,
     output_folder: str = None,
-    chunk_size: int | str = 2048
-) -> None:
+    chunk_size: int | str = 4096
+    ) -> None:
     """
-    Mosaic orthorectified images by sampling the closest_cam_map_file. 
-
+    Mosaic orthorectified images by sampling the closest_cam_map_file.
+    
     Parameters
     ----------
-    image_files : list[str]
-        List of paths to orthorectified images
-    closest_cam_map_file : str
-        Path to the closest camera map
-    output_folder : str
-        Folder to save the mosaic
-    chunk_size : int | str
-        Chunk size for Dask arrays, passed to rioxarray.open_rasterio
+    image_files: list[str]
+        List of paths to orthoimage files to mosaic
+    closest_cam_map_file: str
+        Path to closest camera map file (raster with integer values indicating source image index)
+    output_folder: str
+        Folder to save the output mosaic
+    chunk_size: int | str
+        Chunk size for dask arrays (int or string like "auto" or 4096)
+
+    Returns
+    ----------
+    None
     """
     os.makedirs(output_folder, exist_ok=True)
+    print(f'Using chunk size {chunk_size} to read and compute')
 
-    print("Reading closest camera map")
-    closest_cam_map = rxr.open_rasterio(closest_cam_map_file, chunks=chunk_size)
+    # --- Read closest cam map (lazy) ---
+    print("Lazily reading closest camera map")
+    closest_cam_map = rxr.open_rasterio(closest_cam_map_file, chunks=chunk_size).squeeze()
     crs = closest_cam_map.rio.crs
 
-    print("Reading orthoimages with Dask")
-    datasets = [rxr.open_rasterio(f, masked=True, chunks=chunk_size) for f in image_files]
+    # --- Read all images lazily to probe properties ---
+    print("Lazily reading all orthoimages to determine properties...")
+    datasets_lazy = [rxr.open_rasterio(f, masked=True, chunks=chunk_size) for f in image_files]
 
-    # Verify consistent CRS
-    for ds in datasets:
-        if ds.rio.crs != crs:
-            ds = ds.rio.reproject(crs)
+    # minimum band count
+    min_bands = min(len(ds.band.data) for ds in datasets_lazy)
+    num_bands = min_bands
+    print(f"Detected minimum number of bands across all images: {num_bands}")
 
-    num_bands = datasets[0].rio.count
-    print(f"Detected {num_bands} band(s) per image")
+    # select only needed bands (lazy)
+    datasets_lazy = [ds.sel(band=slice(0, num_bands)) for ds in datasets_lazy]
 
-    # Determine target resolution
-    res_x = np.mean([abs(ds.rio.resolution()[0]) for ds in datasets])
-    res_y = np.mean([abs(ds.rio.resolution()[1]) for ds in datasets])
-    print(f"Target resolution: {res_x:.3f}, {res_y:.3f}")
+    # --- Build target grid ---
+    # target resolution (mean of sources)
+    res_x = np.mean([abs(ds.rio.resolution()[0]) for ds in datasets_lazy])
+    res_y = np.mean([abs(ds.rio.resolution()[1]) for ds in datasets_lazy])
+    print(f"Target resolution: {res_x:.3f}, {res_y:.3f} m")
 
-    # Output bounds & transform
+    # bounds & transform from closest_cam_map (you could also union all images)
     bounds = closest_cam_map.rio.bounds()
     width = int((bounds[2] - bounds[0]) / res_x)
     height = int((bounds[3] - bounds[1]) / res_y)
     transform = rio.transform.from_bounds(*bounds, width=width, height=height)
 
-    # Dummy grid
-    dummy_grid = xr.DataArray(
-        da.full((height, width), 9999, dtype=np.uint16, chunks=(chunk_size, chunk_size)),
+    # build a target grid
+    target_grid = xr.DataArray(
+        da.full((height, width), 0, dtype=np.uint16, chunks=(chunk_size, chunk_size)),
         dims=("y", "x"),
         coords={
             "y": np.linspace(bounds[3], bounds[1], height),
@@ -693,48 +747,76 @@ def mosaic_orthoimages(
         },
     ).rio.write_crs(crs).rio.write_transform(transform)
 
-    # Reproject images lazily with dask
-    print("Reprojecting images to target grid...")
-    reprojected = [
-        ds.rio.reproject_match(dummy_grid, resampling=rio.enums.Resampling.nearest)
-        for ds in datasets
-    ]
+    # reproject the camera index map to the target grid
+    print("Reprojecting closest_cam_map to target grid...")
+    closest_cam_map_on_target = closest_cam_map.rio.reproject_match(
+        target_grid, resampling=rio.enums.Resampling.nearest
+    ).astype(np.int32)
 
-    stack = xr.concat(reprojected, dim="camera")
+    # --- Build a list of per-image contributions ---
+    contributions = []
+    print("Reprojecting images and building per-image contributions...")
+    for i, ds in enumerate(tqdm(datasets_lazy, desc='Processing images')):
+        # select bands if ds has more (safe because we already sliced, but double-check)
+        if ds.rio.count > num_bands:
+            ds = ds.isel(band=slice(0, num_bands))
 
-    # Reproject closest_cam_map lazily
-    closest_cam_map = closest_cam_map.rio.reproject_match(dummy_grid, resampling=rio.enums.Resampling.nearest)
+        # reproject to target grid (lazy)
+        if ds.rio.crs != crs:
+            ds = ds.rio.reproject(crs)
 
-    # Initialize mosaic with dask array
-    print("Creating mosaic")
-    mosaic_shape = (num_bands, height, width)
-    mosaic = xr.DataArray(
-        da.full(mosaic_shape, 9999, dtype=np.uint16, chunks=(1, chunk_size, chunk_size)),
-        dims=("band", "y", "x"),
-        coords={"band": np.arange(1, num_bands + 1), "y": dummy_grid.y, "x": dummy_grid.x},
-    ).rio.write_crs(crs).rio.write_transform(transform)
+        reprojected_ds = ds.rio.reproject_match(target_grid, resampling=rio.enums.Resampling.nearest)
 
-    # Fill mosaic lazily using dask.where
-    for i in range(len(stack.camera)):
-        mask = (closest_cam_map.squeeze() == i)
-        if num_bands == 1:
-            mosaic = xr.where(mask, stack.isel(camera=i)[0], mosaic)
-        else:
-            for b in range(num_bands):
-                mosaic[b] = xr.where(mask, stack.isel(camera=i, band=b), mosaic[b])
-    
-    # Make sure dimensions are in correct order
-    mosaic = mosaic.transpose('band', 'y', 'x')
+        # Standardize nodata to NaN:
+        # prefer ds.rio.nodata if present, but also treat 9999 as nodata sentinel if used
+        nodata_val = ds.rio.nodata
+        if nodata_val is not None:
+            reprojected_ds = reprojected_ds.where(reprojected_ds != nodata_val)
+        # also handle explicit 9999 sentinel if your images use it:
+        reprojected_ds = reprojected_ds.where(reprojected_ds != 9999)
 
-    # Make sure no data value, data type, and CRS are properly set
-    mosaic = mosaic.astype(np.uint16)
+        # Build a boolean mask aligned to the target grid: True where this image contributes
+        mask = (closest_cam_map_on_target == i)
+
+        # Apply mask across band dimension (broadcasting will do the right thing)
+        # result has dims (band, y, x) with NaN where mask is False
+        contribution = reprojected_ds.where(mask)
+
+        # Ensure coords/dims are exactly (band, y, x)
+        # reprojected_ds is typically (band, y, x) already; if not, adjust (keep it consistent)
+        contribution = contribution.transpose("band", "y", "x")
+
+        contributions.append(contribution)
+
+        # close the source dataset to free handles
+        ds.close()
+
+    if not contributions:
+        raise ValueError("No contributions created — check image_files / closest_cam_map content.")
+
+    # --- Combine all contributions ---
+    print("Combining per-image contributions into final mosaic...")
+    mosaic = functools.reduce(lambda a, b: a.combine_first(b), contributions)
+
+    # --- Finalize nodata metadata and dtype ---
+    print("Applying final formatting...")
+    mosaic = mosaic.dropna(dim='x', how='all').dropna(dim='y', how='all')
+    mosaic = mosaic.fillna(9999).astype(np.uint16)
     mosaic = mosaic.rio.write_nodata(9999)
     mosaic = mosaic.rio.write_crs(crs)
+    mosaic = mosaic.rio.write_transform(transform)
 
-    # Save mosaic (compute in chunks)
+    # --- Write to disk (computes lazily) ---
     mosaic_file = os.path.join(output_folder, "orthomosaic.tiff")
-    print("Saving mosaic...")
+    print("Saving orthomosaic...")
     mosaic.rio.to_raster(mosaic_file, compute=True)
     print("Saved orthomosaic:", mosaic_file)
-    
+
+    # Cleanup any remaining dataset handles
+    for ds in datasets_lazy:
+        try:
+            ds.close()
+        except Exception:
+            pass
+
     return

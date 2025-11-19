@@ -13,7 +13,7 @@ python generate_orthoimage.py \
 -inputs_folder <path_to_inputs_folder> \
 -output_folder <path_to_output_folder> \
 -refine_cameras <0/1> \
--output_res 0.003 \
+-output_res 0.002
 
 """
 
@@ -27,6 +27,7 @@ import pandas as pd
 import numpy as np
 from ast import literal_eval
 from tqdm import tqdm
+
 # import the utility functions, assuming the ortho_utils.py file is in the root code directory
 import ortho_utils
 
@@ -41,6 +42,8 @@ def getparser():
     parser.add_argument('-inputs_folder', default=None, type=str, help='Path to folder containing standard input files')
     parser.add_argument('-output_folder', default=None, type=str, help='Path to folder where all outputs will be saved')
     parser.add_argument('-refine_cameras', default=1, type=int, choices=[0,1], help='Whether to re-calibrate cameras. Recommended if cameras have moved slightly since initial lidar scan.')
+    parser.add_argument('-output_res', default=0.002, type=float, help='Target output resolution for orthoimages and orthomosaic in meters.')
+
     return parser
 
 
@@ -54,6 +57,7 @@ def main():
     inputs_folder = args.inputs_folder
     output_folder = args.output_folder
     refine_cameras = bool(args.refine_cameras)
+    output_res = args.output_res
 
     # --- Define output folders ---
     out_folder = os.path.join(output_folder, 'soo_locks_photogrammetry_' + target_datetime)
@@ -68,7 +72,7 @@ def main():
     # Configure logging: writes to file and console
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s : %(message)s",
         handlers=[
             logging.FileHandler(log_file, mode='w'),
             logging.StreamHandler(sys.stdout)
@@ -92,7 +96,7 @@ def main():
     init_cams_file = os.path.join(inputs_folder, 'original_calibrated_cameras.csv')
     init_images_folder = os.path.join(inputs_folder, 'original_images')
     init_image_files = sorted(glob(os.path.join(init_images_folder, '*.tiff')))
-    gcp_file = os.path.join(inputs_folder, 'GCP_merged_stable.gpkg')
+    gcp_file = os.path.join(inputs_folder, 'GCP_merged.gpkg')
     refdem_file = os.path.join(inputs_folder, 'lidar_DSM_filled_cropped.tif')
     closest_cam_map_file = os.path.join(inputs_folder, 'closest_camera_map.tiff')
 
@@ -159,7 +163,7 @@ def main():
 
     # Open the refined cameras file
     cams = pd.read_csv(refined_cams_file)
-    for k in ['K', 'D', 'K_full', 'rvec', 'tvec']:
+    for k in ['K', 'dist', 'rvec', 'tvec']:
         cams[k] = cams[k].apply(literal_eval)
 
     # Iterate over image files
@@ -177,13 +181,18 @@ def main():
         ch = 'ch' + os.path.basename(image_file).split('ch')[1][0:2]
         cam = cams.loc[cams['channel']==ch]
         K = np.array(cam['K'].values[0])
-        D = np.array(cam['D'].values[0])
-        K_full = np.array(cam['K_full'].values[0])
+        dist = np.array(cam['dist'].values[0])
         rvec = np.array(cam['rvec'].values[0])
         tvec = np.array(cam['tvec'].values[0])
 
         # orthorectify
-        ortho_utils.orthorectify(image_file, refdem_file, K, D, K_full, rvec, tvec, ortho_file)
+        ortho_utils.orthorectify(
+            image_file, refdem_file, 
+            K, dist, rvec, tvec,
+            target_res = output_res,
+            out_folder = ortho_folder,
+            target_datetime = target_datetime
+            )
     
     print('\n------------------------------')
     print('--- MOSAICKING ORTHOIMAGES ---')
