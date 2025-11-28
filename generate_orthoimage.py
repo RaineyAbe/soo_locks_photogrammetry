@@ -97,8 +97,8 @@ def main():
     init_images_folder = os.path.join(inputs_folder, 'original_images')
     init_image_files = sorted(glob(os.path.join(init_images_folder, '*.tiff')))
     gcp_file = os.path.join(inputs_folder, 'GCP_merged.gpkg')
-    refdem_file = os.path.join(inputs_folder, 'lidar_DSM_filled_cropped.tif')
-    closest_cam_map_file = os.path.join(inputs_folder, 'closest_camera_map.tiff')
+    refdem_file = os.path.join(inputs_folder, 'TLS_DTM_cropped_filled.tif')
+    closest_cam_map_file = os.path.join(inputs_folder, 'closest_camera_map.tif')
 
     # Make sure they exist
     if not os.path.exists(inputs_folder):
@@ -179,7 +179,8 @@ def main():
 
         # get the camera parameters
         ch = 'ch' + os.path.basename(image_file).split('ch')[1][0:2]
-        cam = cams.loc[cams['channel']==ch]
+        ch_int = int(ch[2:])
+        cam = cams.loc[cams['channel']==ch_int]
         K = np.array(cam['K'].values[0])
         dist = np.array(cam['dist'].values[0])
         rvec = np.array(cam['rvec'].values[0])

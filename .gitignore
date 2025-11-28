@@ -8,3 +8,4 @@
 .local/*
 .python_history
 *.pyc
+camera_calibration/__pycache__/model_camera_coverage_utils.cpython-312.pyc

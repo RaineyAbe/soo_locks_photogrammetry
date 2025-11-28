@@ -112,14 +112,25 @@ def extract_frame_at_clock_time(
         cap.release()
         return False
     
-    # Determine the camera number
-    ch = os.path.basename(video_file).split('ch')[1][0:2]
-    if (frame.shape[1] > 4000) & (ch=='1_'):
-        ch = '09'
-    elif (frame.shape[1] > 4000):
-        ch = str(int(ch[0]) + 8)
+    # Determine the camera number (should work for Windows or Mac/Linux)
+    nearest_folder = video_file.split(os.sep)[-2]
+    video_basename = video_file.split(os.sep)[-1]
+    # get the default camera number
+    ch_int = int(video_basename.split('ch')[1][0:2].replace('_',''))
+    # cameras 1-8: in folder with "1" in it
+    if '1' in nearest_folder:
+        ch = f"0{ch_int}"
+    # cameras 9-16: in folder with "2" in it
+    elif '2' in nearest_folder:
+        ch_int += 8
+        ch = f"0{ch_int}" if ch_int==9 else str(ch_int)
+    # cameras 17-24: in folder with "3" in it
+    elif '3' in nearest_folder:
+        ch_int += 16
+        ch = str(ch_int)
     else:
-        ch = '0' + ch[0]
+        raise ValueError('Could not assign camera numbers.' 
+                         'Please place "1", "2", and/or "3" in each respective video folder name to distinguish cameras.')
 
     # Save to file
     output_image_file = os.path.join(
@@ -128,7 +139,7 @@ def extract_frame_at_clock_time(
         )
     
     # make sure frame has int datatype
-    frame = frame.astype(np.int8)
+    # frame = frame.astype(np.int32)
 
     if cv2.imwrite(output_image_file, frame):
         print(f"Extracted frame -> {output_image_file}")
@@ -590,11 +601,10 @@ def orthorectify(
     # --- Create dense ortho grid at target resolution ---
     x_min, x_max = float(dem_clipped.x.min()), float(dem_clipped.x.max())
     y_min, y_max = float(dem_clipped.y.min()), float(dem_clipped.y.max())
-    Nx = int(np.ceil((x_max - x_min) / target_res)) + 1
-    Ny = int(np.ceil((y_max - y_min) / target_res)) + 1
-
-    X_grid = np.linspace(x_min, x_max, Nx, dtype=np.float32)
-    Y_grid = np.linspace(y_min, y_max, Ny, dtype=np.float32)
+    Nx = int(np.ceil((x_max - x_min)/target_res)) + 1
+    Ny = int(np.ceil((y_max - y_min)/target_res)) + 1
+    X_grid = np.linspace(x_min, x_max, Nx, dtype=np.float64)
+    Y_grid = np.linspace(y_min, y_max, Ny, dtype=np.float64)
     XX, YY = np.meshgrid(X_grid, Y_grid)
 
     # Interpolate DEM onto ortho grid
@@ -603,6 +613,7 @@ def orthorectify(
 
     # --- Flatten grid and transform to camera coordinates ---
     world_pts = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], axis=1)
+    tvec = tvec.reshape(3, 1)
     cam_pts = (R @ world_pts.T + tvec).T
 
     # --- Mask points behind camera or above max elevation ---
@@ -650,7 +661,7 @@ def orthorectify(
         ortho[b][np.isnan(map_x)] = np.nan
         ortho[b][np.isnan(map_y)] = np.nan
 
-    # --- Wrap as xarray ---
+    # --- Convert to xarray ---
     ortho_xr = xr.DataArray(
         ortho,
         dims=("band", "y", "x"),
@@ -812,7 +823,7 @@ def mosaic_orthoimages(
     mosaic.rio.to_raster(mosaic_file, compute=True)
     print("Saved orthomosaic:", mosaic_file)
 
-    # Cleanup any remaining dataset handles
+    # Close any open datasets
     for ds in datasets_lazy:
         try:
             ds.close()
